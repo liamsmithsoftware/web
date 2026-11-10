@@ -3,63 +3,51 @@
 
 این فایل توسط start_windows.bat فراخوانی می‌شود و کارهای زیر را انجام می‌دهد:
   1) ساخت محیط مجازی و نصب وابستگی‌ها (فقط از wheel آماده — بدون نیاز به کامپایلر C)
-  2) انتخاب خودکار پورت آزاد (در صورت اشغال بودن پورت پیش‌فرض)
+  2) تشخیص هوشمند اشغال بودن پورت (بدون اختلال از سمت پروکسی ویندوز یا سرویس‌های غیر HTTP)
+     و انتقال خودکار به پورت آزاد بعدی در صورت اشغال بودن پورت توسط برنامه دیگر
   3) اجرای سرور و باز کردن خودکار مرورگر روی آدرس پنل مدیریت
-
-چرا این فایل وجود دارد؟ منطق کنسول ویندوز (cmd.exe) برای متن فارسی و
-پرانتزهای داخل if/else بسیار شکننده است؛ بنابراین تمام منطق به پایتون منتقل
-شده تا هیچ دستور پیچیده‌ای در فایل .bat باقی نماند.
 """
 from __future__ import annotations
 
 import os
-import socket
 import subprocess
 import sys
 import threading
-import urllib.error
-import urllib.request
 import webbrowser
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from app.utils.port_utils import (  # noqa: E402
+    APP_ID,
+    find_free_port,
+    is_our_app_running,
+    is_port_free,
+)
+
 VENV_DIR = ROOT / ".venv"
 VENV_PY = VENV_DIR / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
 MIN_PYTHON = (3, 10)
+DEFAULT_HOST = os.getenv("WEB_COLLECTOR_HOST", "0.0.0.0")
 DEFAULT_PORT = int(os.getenv("WEB_COLLECTOR_PORT", "8000"))
-APP_ID = "website-content-collector"
 
 
-def port_is_free(port: int, host: str = "127.0.0.1") -> bool:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            sock.bind((host, port))
-        except OSError:
-            return False
-    return True
+def port_is_free(port: int, host: str = DEFAULT_HOST) -> bool:
+    return is_port_free(port, host)
 
 
-def is_our_app_running(port: int, host: str = "127.0.0.1") -> bool:
-    try:
-        with urllib.request.urlopen(f"http://{host}:{port}/healthz", timeout=2) as response:
-            body = response.read(300).decode("utf-8", "replace")
-        return APP_ID in body and "ok" in body
-    except (urllib.error.URLError, OSError, ValueError):
-        return False
-
-
-def pick_port(preferred: int) -> int:
-    if port_is_free(preferred):
+def pick_port(preferred: int, host: str = DEFAULT_HOST) -> int:
+    if port_is_free(preferred, host):
         return preferred
-    if is_our_app_running(preferred):
+    if is_our_app_running(preferred, host, app_id=APP_ID):
         return preferred
-    print(f"      Port {preferred} is already in use, looking for a free one ...")
-    for candidate in range(preferred + 1, preferred + 21):
-        if port_is_free(candidate):
-            print(f"      Using port {candidate} instead.")
-            return candidate
-    return preferred
+
+    new_port = find_free_port(preferred + 1, host=host)
+    print(f"      پورت {preferred} توسط برنامه دیگری اشغال است؛ انتقال خودکار به پورت آزاد {new_port} ...")
+    print(f"      Port {preferred} is occupied by another program -> using port {new_port} instead.")
+    return new_port
 
 
 def open_browser(port: int) -> None:
@@ -159,6 +147,48 @@ def install_dependencies(python: str) -> tuple[bool, str]:
     return True, ""
 
 
+def _extract_cli_options(args: list[str]) -> tuple[str, int | None, bool, list[str]]:
+    """Parse --host, --port/-p, and --strict-port while preserving remaining args."""
+    bind_host = DEFAULT_HOST
+    explicit_port: int | None = None
+    strict_port = False
+    cleaned: list[str] = []
+
+    idx = 0
+    while idx < len(args):
+        arg = args[idx]
+        if arg == "--strict-port":
+            strict_port = True
+            cleaned.append(arg)
+        elif arg in ("--port", "-p") and idx + 1 < len(args):
+            try:
+                explicit_port = int(args[idx + 1])
+                idx += 2
+                continue
+            except ValueError:
+                cleaned.append(arg)
+        elif arg.startswith("--port="):
+            try:
+                explicit_port = int(arg.split("=", 1)[1])
+                idx += 1
+                continue
+            except ValueError:
+                cleaned.append(arg)
+        elif arg == "--host" and idx + 1 < len(args):
+            bind_host = args[idx + 1]
+            cleaned.extend([arg, bind_host])
+            idx += 2
+            continue
+        elif arg.startswith("--host="):
+            bind_host = arg.split("=", 1)[1]
+            cleaned.append(arg)
+        else:
+            cleaned.append(arg)
+        idx += 1
+
+    return bind_host, explicit_port, strict_port, cleaned
+
+
 def main() -> int:
     for stream in (sys.stdout, sys.stderr):
         try:
@@ -182,29 +212,18 @@ def main() -> int:
     if not ok:
         return fail(error)
 
-    args = list(sys.argv[1:])
+    bind_host, explicit_port, strict_port, passthrough_args = _extract_cli_options(list(sys.argv[1:]))
+    desired_port = explicit_port if explicit_port is not None else DEFAULT_PORT
 
-    explicit_port: int | None = None
-    for idx, arg in enumerate(args):
-        if arg in ("--port", "-p") and idx + 1 < len(args):
-            try:
-                explicit_port = int(args[idx + 1])
-            except ValueError:
-                explicit_port = None
-        elif arg.startswith("--port="):
-            try:
-                explicit_port = int(arg.split("=", 1)[1])
-            except ValueError:
-                explicit_port = None
-
-    if explicit_port is not None:
-        resolved_port = explicit_port
-        if port_is_free(explicit_port) or is_our_app_running(explicit_port):
+    if strict_port:
+        resolved_port = desired_port
+        if port_is_free(resolved_port, bind_host) or is_our_app_running(resolved_port, bind_host):
             open_browser(resolved_port)
     else:
-        resolved_port = pick_port(DEFAULT_PORT)
-        args += ["--port", str(resolved_port)]
+        resolved_port = pick_port(desired_port, bind_host)
         open_browser(resolved_port)
+
+    run_args = [*passthrough_args, "--port", str(resolved_port)]
 
     print("[3/3] Starting server ...")
     print(f"      Address:  http://localhost:{resolved_port}")
@@ -217,7 +236,7 @@ def main() -> int:
     env.setdefault("PYTHONUTF8", "1")
 
     try:
-        return subprocess.run([python, str(ROOT / "run.py"), *args], cwd=str(ROOT), env=env).returncode
+        return subprocess.run([python, str(ROOT / "run.py"), *run_args], cwd=str(ROOT), env=env).returncode
     except KeyboardInterrupt:
         return 0
 
