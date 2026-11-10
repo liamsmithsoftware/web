@@ -4,60 +4,47 @@
 
 استفاده:
     python run.py                 # اجرا روی 0.0.0.0:8000 (در صورت اشغال، پورت آزاد بعدی)
-    python run.py --port 9000     # تغییر پورت
+    python run.py --port 9000     # تغییر پورت (در صورت اشغال، پورت آزاد بعدی)
     python run.py --reload        # حالت توسعه (بارگذاری خودکار)
 """
 from __future__ import annotations
 
 import argparse
 import os
-import socket
 import sys
-import urllib.error
-import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-APP_ID = "website-content-collector"
+from app.utils.port_utils import (  # noqa: E402
+    APP_ID,
+    find_free_port,
+    is_our_app_running,
+    is_port_free,
+)
 
 
 def port_available(host: str, port: int) -> bool:
-    """True when nothing else is listening on this port."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            sock.bind((host, port))
-        except OSError:
-            return False
-    return True
+    """True when nothing else is listening on this port and it can be bound."""
+    return is_port_free(port, host)
 
 
 def is_our_app(host: str, port: int) -> bool:
-    """Check whether the service already on that port is this very program."""
-    probe_host = "127.0.0.1" if host in ("0.0.0.0", "", "::") else host
-    try:
-        with urllib.request.urlopen(f"http://{probe_host}:{port}/healthz", timeout=2) as response:
-            body = response.read(300).decode("utf-8", "replace")
-        return APP_ID in body and '"status"' in body and "ok" in body
-    except (urllib.error.URLError, OSError, ValueError):
-        return False
+    """Safely check whether the service already on that port is this very program."""
+    return is_our_app_running(port, host, app_id=APP_ID)
 
 
-def pick_free_port(host: str, start_port: int, span: int = 20) -> int:
-    for candidate in range(start_port, start_port + span):
-        if port_available(host, candidate):
-            return candidate
-    return start_port
+def pick_free_port(host: str, start_port: int, span: int = 200) -> int:
+    return find_free_port(start_port, host=host, span=span)
 
 
 def handle_busy_port(host: str, port: int) -> int:
     """
     Decides what to do when the requested port is occupied.
-    Returns the port that should actually be used (exits cleanly when this
-    exact program is already running, so the user never sees WinError 10048).
+    Returns a free fallback port whenever another program occupies `port`, and
+    exits cleanly (0) if this exact application is already running on `port`.
     """
     if port_available(host, port):
         return port
@@ -68,7 +55,7 @@ def handle_busy_port(host: str, port: int) -> int:
     print("=" * 62)
     print(f"  پورت {port} در حال حاضر اشغال است.")
     if already_running:
-        print("  به نظر می‌رسد برنامه از قبل در حال اجراست.")
+        print("  به نظر می‌رسد همین برنامه از قبل در حال اجراست.")
         print(f"  پنل مدیریت:  http://localhost:{port}")
         print()
         print("  اگر پنجره قدیمی را می‌بینید، ابتدا آن را ببندید (یا Ctrl+C بزنید)")
@@ -77,7 +64,8 @@ def handle_busy_port(host: str, port: int) -> int:
         raise SystemExit(0)
 
     new_port = pick_free_port(host, port + 1)
-    print(f"  برنامه روی پورت آزاد {new_port} اجرا می‌شود:")
+    print(f"  پورت {port} توسط برنامه دیگری اشغال شده است.")
+    print(f"  برنامه به صورت خودکار روی پورت آزاد {new_port} اجرا می‌شود:")
     print(f"  پنل مدیریت:  http://localhost:{new_port}")
     print("=" * 62)
     print()
