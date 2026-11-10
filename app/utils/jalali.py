@@ -3,7 +3,7 @@ from __future__ import annotations
 import email.utils
 import re
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -29,6 +29,33 @@ PERSIAN_MONTHS = {
     "اسفند": 12,
 }
 
+ENGLISH_MONTHS = {
+    "january": 1,
+    "jan": 1,
+    "february": 2,
+    "feb": 2,
+    "march": 3,
+    "mar": 3,
+    "april": 4,
+    "apr": 4,
+    "may": 5,
+    "june": 6,
+    "jun": 6,
+    "july": 7,
+    "jul": 7,
+    "august": 8,
+    "aug": 8,
+    "september": 9,
+    "sept": 9,
+    "sep": 9,
+    "october": 10,
+    "oct": 10,
+    "november": 11,
+    "nov": 11,
+    "december": 12,
+    "dec": 12,
+}
+
 JALALI_NUMERIC_RE = re.compile(
     r"(?<!\d)(1[34]\d{2})[/\-.](\d{1,2})[/\-.](\d{1,2})(?!\d)"
     r"(?:[\s،,\-–—|ساعتT]*(\d{1,2}):(\d{2})(?::(\d{2}))?)?"
@@ -44,6 +71,22 @@ PERSIAN_NAMED_DATE_RE = re.compile(
     + "|".join(PERSIAN_MONTHS.keys())
     + r")\s+(1[34]\d{2})(?!\d)"
     r"(?:[\s،,\-–—|ساعت]*(\d{1,2}):(\d{2})(?::(\d{2}))?)?"
+)
+
+_EN_MONTH_PATTERN = "|".join(sorted(ENGLISH_MONTHS.keys(), key=len, reverse=True))
+
+# Matches e.g. "November 6, 2026", "Nov. 9th, 2026 2:30 pm", "November 9th"
+ENGLISH_MDY_RE = re.compile(
+    rf"\b({_EN_MONTH_PATTERN})\.?\s+(\d{{1,2}})(?:st|nd|rd|th)?(?:\s*,?\s*(20\d{{2}}))?(?!\d)"
+    r"(?:[\s,\-–—|at]*(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(am|pm)?)?",
+    re.IGNORECASE,
+)
+
+# Matches e.g. "6 November 2026", "9th Nov 2026, 14:30"
+ENGLISH_DMY_RE = re.compile(
+    rf"(?<!\d)(\d{{1,2}})(?:st|nd|rd|th)?\s+({_EN_MONTH_PATTERN})\.?(?:\s*,?\s*(20\d{{2}}))?(?!\d)"
+    r"(?:[\s,\-–—|at]*(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(am|pm)?)?",
+    re.IGNORECASE,
 )
 
 
@@ -145,6 +188,42 @@ def parse_filter_date_to_gregorian(date_str: Optional[str]) -> Optional[str]:
             raise ValueError(f"تاریخ میلادی «{date_str}» معتبر نیست.") from exc
 
 
+def _build_english_datetime(
+    *,
+    year_str: Optional[str],
+    month: int,
+    day: int,
+    hour_str: Optional[str],
+    minute_str: Optional[str],
+    second_str: Optional[str],
+    ampm: Optional[str],
+    local_tz: ZoneInfo,
+) -> Optional[datetime]:
+    now_utc = utc_now()
+    inferred_year = year_str is None
+    year = int(year_str) if year_str else now_utc.year
+    hour = int(hour_str or 0)
+    minute = int(minute_str or 0)
+    second = int(second_str or 0)
+
+    if ampm:
+        ap = ampm.lower()
+        if ap == "pm" and hour < 12:
+            hour += 12
+        elif ap == "am" and hour == 12:
+            hour = 0
+
+    try:
+        dt = datetime(year, month, day, hour, minute, second, tzinfo=local_tz).astimezone(timezone.utc)
+        if inferred_year and dt > now_utc + timedelta(days=3):
+            dt = datetime(year - 1, month, day, hour, minute, second, tzinfo=local_tz).astimezone(
+                timezone.utc
+            )
+        return dt
+    except ValueError:
+        return None
+
+
 def parse_any_datetime(
     raw_value: Optional[str],
     tz_name: str = "Asia/Tehran",
@@ -156,6 +235,7 @@ def parse_any_datetime(
     - Unix timestamps (seconds or milliseconds)
     - Jalali numeric (۱۴۰۵/۰۸/۱۹ - ۱۴:۳۰ or 1405-08-19 14:30:00)
     - Persian month names (۱۹ آبان ۱۴۰۵ ساعت ۱۴:۳۰)
+    - English month names (November 6, 2026 / 6 Nov 2026 / November 9th)
     Returns a timezone-aware UTC datetime, or None if unparseable.
     """
     if raw_value is None:
@@ -181,7 +261,6 @@ def parse_any_datetime(
     iso_candidate = text
     if iso_candidate.endswith("Z") or iso_candidate.endswith("z"):
         iso_candidate = iso_candidate[:-1] + "+00:00"
-    # Fix +0330 -> +03:30
     iso_candidate = re.sub(r"([+-]\d{2})(\d{2})$", r"\1:\2", iso_candidate)
     try:
         dt = datetime.fromisoformat(iso_candidate)
@@ -227,7 +306,7 @@ def parse_any_datetime(
             except ValueError:
                 pass
 
-    # 5. Jalali numeric (e.g. 1405/08/19 - 14:30:00)
+    # 5. Jalali numeric (e.g. 1405/08/19 14:30)
     m_jalali = JALALI_NUMERIC_RE.search(text)
     if m_jalali:
         year = int(m_jalali.group(1))
@@ -251,7 +330,7 @@ def parse_any_datetime(
         except ValueError:
             pass
 
-    # 6. Gregorian numeric embedded in text (e.g. 2026/11/10 14:30)
+    # 6. Gregorian numeric inside arbitrary text (e.g. "Published: 2026/11/10 - 14:30")
     m_greg = GREGORIAN_NUMERIC_RE.search(text)
     if m_greg:
         year = int(m_greg.group(1))
@@ -265,5 +344,41 @@ def parse_any_datetime(
             return local_dt.astimezone(timezone.utc)
         except ValueError:
             pass
+
+    # 7. English month-first ("November 6, 2026" / "November 9th")
+    m_en_mdy = ENGLISH_MDY_RE.search(text)
+    if m_en_mdy:
+        month = ENGLISH_MONTHS.get(m_en_mdy.group(1).lower(), 0)
+        if month:
+            built = _build_english_datetime(
+                year_str=m_en_mdy.group(3),
+                month=month,
+                day=int(m_en_mdy.group(2)),
+                hour_str=m_en_mdy.group(4),
+                minute_str=m_en_mdy.group(5),
+                second_str=m_en_mdy.group(6),
+                ampm=m_en_mdy.group(7),
+                local_tz=local_tz,
+            )
+            if built is not None:
+                return built
+
+    # 8. English day-first ("6 November 2026" / "9th Nov")
+    m_en_dmy = ENGLISH_DMY_RE.search(text)
+    if m_en_dmy:
+        month = ENGLISH_MONTHS.get(m_en_dmy.group(2).lower(), 0)
+        if month:
+            built = _build_english_datetime(
+                year_str=m_en_dmy.group(3),
+                month=month,
+                day=int(m_en_dmy.group(1)),
+                hour_str=m_en_dmy.group(4),
+                minute_str=m_en_dmy.group(5),
+                second_str=m_en_dmy.group(6),
+                ampm=m_en_dmy.group(7),
+                local_tz=local_tz,
+            )
+            if built is not None:
+                return built
 
     return None

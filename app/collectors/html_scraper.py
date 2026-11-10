@@ -18,8 +18,10 @@ SKIP_PATH_PATTERNS = re.compile(
     r"(?:^|/)(?:"
     r"login|signin|sign-in|signup|sign-up|register|logout|account|profile|cart|checkout|"
     r"contact|contact-us|about|about-us|privacy|privacy-policy|terms|faq|ads|advertise|"
+    r"donate|subscribe|newsletter|careers|jobs|press-kit|"
     r"search|wp-login\.php|wp-admin|wp-json|xmlrpc\.php|feed|rss|atom|sitemap|"
-    r"tag|tags|author|authors|users|comment|comments|reply"
+    r"tag|tags|issue|issues|topic|topics|category|categories|team|staff|experts|"
+    r"author|authors|users|comment|comments|reply"
     r")(?:/|$|\?)",
     re.IGNORECASE,
 )
@@ -30,7 +32,11 @@ STATIC_ASSET_EXT_RE = re.compile(
 )
 
 ARTICLE_HINT_URL_RE = re.compile(
-    r"(?:/\d{4}/\d{1,2}/|/\d{4,}|/(?:news|post|posts|article|articles|blog|story|content|fa/news|detail|view)/|[?&](?:p|id|newsid)=\d+)",
+    r"(?:/\d{4}/\d{1,2}/|/\d{4,}|"
+    r"/(?:news|post|posts|article|articles|blog|story|content|fa/news|detail|view|"
+    r"analysis|podcasts|podcast|in_the_news|research|reports|report|insights|insight|"
+    r"publications|publication|commentary|opinions|opinion|briefs|brief|press-releases)/|"
+    r"[?&](?:p|id|newsid)=\d+)",
     re.IGNORECASE,
 )
 
@@ -379,13 +385,15 @@ def extract_listing_posts(
             if not guid or guid in posts_by_guid:
                 continue
 
-            text = re.sub(r"\s+", " ", a_tag.get_text(" ", strip=True)).strip()
-            if not text:
-                h_inside = a_tag.find(["h1", "h2", "h3", "h4", "span"])
-                text = h_inside.get_text(" ", strip=True) if h_inside else ""
+            h_inside = a_tag.find(["h1", "h2", "h3", "h4", "h5"])
+            title_el = h_inside or a_tag.select_one('[class*="title"], [class*="headline"]')
+            if title_el and len(title_el.get_text(" ", strip=True)) >= 8:
+                text = re.sub(r"\s+", " ", title_el.get_text(" ", strip=True)).strip()
+            else:
+                text = re.sub(r"\s+", " ", a_tag.get_text(" ", strip=True)).strip()
 
-            in_heading = a_tag.find_parent(["h1", "h2", "h3", "h4"]) is not None or bool(
-                a_tag.find(["h1", "h2", "h3", "h4"])
+            in_heading = a_tag.find_parent(["h1", "h2", "h3", "h4", "h5"]) is not None or bool(
+                h_inside
             )
             url_looks_article = bool(ARTICLE_HINT_URL_RE.search(norm_url)) or norm_url.count("/") >= 4
 
@@ -395,7 +403,13 @@ def extract_listing_posts(
                 continue
 
             parent_box = a_tag.find_parent(["li", "div", "section"]) or a_tag
-            pub_dt = _extract_datetime_from_tag(parent_box, tz_name=tz_name)
+            pub_dt = _extract_datetime_from_tag(a_tag, tz_name=tz_name) or _extract_datetime_from_tag(
+                parent_box, tz_name=tz_name
+            )
+            if pub_dt is None:
+                # Fallback: scan short card text inside the anchor/card for inline dates (e.g. "November 9th")
+                card_snippet = a_tag.get_text(" ", strip=True)[:220]
+                pub_dt = parse_any_datetime(card_snippet, tz_name=tz_name)
             img_url = _extract_img_url(parent_box, norm_url)
 
             post = FetchedPost(
