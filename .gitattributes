@@ -1,0 +1,3 @@
+# Ensure Windows batch scripts always keep CRLF and shell scripts keep LF
+*.bat text eol=crlf
+*.sh text eol=lf
