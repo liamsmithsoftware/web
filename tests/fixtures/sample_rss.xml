@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/" xmlns:dc="http://purl.org/dc/elements/1.1/">
+  <channel>
+    <title>خبرگزاری فناوری نمونه</title>
+    <link>https://techsample.ir/</link>
+    <description>آخرین اخبار فناوری</description>
+    <item>
+      <title>خبر سوم و جدیدترین مطلب</title>
+      <link>https://techsample.ir/news/103?utm_source=rss</link>
+      <guid>https://techsample.ir/news/103</guid>
+      <pubDate>Tue, 10 Nov 2026 10:00:00 +0000</pubDate>
+      <description><![CDATA[<p>خلاصه خبر سوم</p>]]></description>
+      <content:encoded><![CDATA[<p>متن کامل خبر سوم در بخش محتوای غنی فید قرار دارد و جزئیات بیشتری ارائه می‌دهد.</p><p>پاراگراف دوم خبر سوم برای تست تبدیل پاراگراف‌ها.</p>]]></content:encoded>
+      <enclosure url="https://techsample.ir/img/103.jpg" type="image/jpeg" />
+    </item>
+    <item>
+      <title>خبر دوم با ویدیو</title>
+      <link>https://techsample.ir/news/102</link>
+      <guid>post-102</guid>
+      <pubDate>Tue, 10 Nov 2026 08:30:00 +0000</pubDate>
+      <description><![CDATA[توضیح کوتاه خبر دوم]]></description>
+      <enclosure url="https://techsample.ir/media/102.mp4" type="video/mp4" />
+    </item>
+    <item>
+      <title>خبر اول قدیمی‌تر</title>
+      <link>https://techsample.ir/news/101</link>
+      <guid>post-101</guid>
+      <pubDate>Tue, 10 Nov 2026 06:00:00 +0000</pubDate>
+      <description>متن ساده خبر اول</description>
+    </item>
+  </channel>
+</rss>
