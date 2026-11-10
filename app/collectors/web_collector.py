@@ -4,14 +4,10 @@ import asyncio
 from typing import Any, Dict, List, Optional
 from urllib.parse import urljoin, urlparse
 
-import httpx
-
 from app.collectors.base import (
     CollectorError,
     FetchBatchResult,
     FetchedPost,
-    build_httpx_proxy_url,
-    build_request_headers,
 )
 from app.collectors.feed_parser import (
     discover_feed_urls_in_html,
@@ -19,13 +15,21 @@ from app.collectors.feed_parser import (
     parse_feed_content,
 )
 from app.collectors.html_scraper import extract_article_details, extract_listing_posts
-from app.config import DEFAULT_REQUEST_TIMEOUT, DEFAULT_TIMEZONE
+from app.collectors.http_fetcher import HttpFetchResponse, SmartHttpFetcher
+from app.collectors.wp_api_parser import (
+    discover_wp_posts_api_url,
+    is_wordpress_html,
+    is_wp_posts_json,
+    parse_wp_posts_json,
+)
+from app.config import DEFAULT_TIMEZONE
 from app.utils.site_parser import looks_like_feed_url, parse_site_input
 
 COMMON_ROOT_FEED_PATHS = (
+    "/feed/",
     "/feed",
-    "/rss",
     "/rss.xml",
+    "/rss",
     "/feed.xml",
     "/atom.xml",
 )
@@ -36,33 +40,23 @@ def _is_root_like_url(url: str) -> bool:
     return path in ("", "/", "/fa", "/en", "/index.html", "/index.php")
 
 
+def _origin_of(url: str) -> str:
+    parsed = urlparse(url)
+    if parsed.scheme and parsed.netloc:
+        return f"{parsed.scheme}://{parsed.netloc}/"
+    return url
+
+
 class WebSiteCollector:
     """
-    Hybrid Website Collector supporting:
-      - 'auto': Smart RSS/Atom discovery + HTML page scraping fallback
+    Hybrid Anti-403 Website Collector supporting:
+      - 'auto': Smart RSS/Atom + WordPress REST API + HTML scraping fallback
       - 'rss':  Strict RSS / Atom / JSON Feed reader
       - 'html': Direct HTML listing & article scraper
+    Uses SmartHttpFetcher (HTTP/2 + TLS/JA3 browser impersonation + OS proxy support).
     """
 
     MAX_CONCURRENT_ARTICLE_FETCHES = 4
-
-    def _client_kwargs(self, settings: Dict[str, str]) -> Dict[str, Any]:
-        proxy_url = build_httpx_proxy_url(settings)
-        headers = build_request_headers(settings)
-        verify_ssl = settings.get("verify_ssl", "1") != "0"
-        try:
-            timeout_sec = float(settings.get("request_timeout") or DEFAULT_REQUEST_TIMEOUT)
-            timeout_sec = max(5.0, min(120.0, timeout_sec))
-        except (TypeError, ValueError):
-            timeout_sec = float(DEFAULT_REQUEST_TIMEOUT)
-
-        return {
-            "headers": headers,
-            "follow_redirects": True,
-            "timeout": httpx.Timeout(timeout_sec, connect=min(15.0, timeout_sec)),
-            "proxy": proxy_url,
-            "verify": verify_ssl,
-        }
 
     async def fetch_site_posts(
         self,
@@ -78,72 +72,109 @@ class WebSiteCollector:
         if not canonical_url:
             raise CollectorError("آدرس وب‌سایت نامعتبر یا خالی است.")
 
-        try:
-            async with httpx.AsyncClient(**self._client_kwargs(settings)) as client:
-                if mode == "html":
-                    return await self._fetch_via_html(client, canonical_url, tz_name)
+        fetcher = SmartHttpFetcher(settings)
 
-                if mode == "rss":
-                    return await self._fetch_via_rss_strict(
-                        client, canonical_url, known_feed_url, tz_name
-                    )
+        if mode == "html":
+            return await self._fetch_via_html(fetcher, canonical_url, tz_name)
 
-                # Default: 'auto' (smart hybrid)
-                return await self._fetch_via_auto(
-                    client, canonical_url, known_feed_url, tz_name
+        if mode == "rss":
+            return await self._fetch_via_rss_strict(
+                fetcher, canonical_url, known_feed_url, tz_name
+            )
+
+        return await self._fetch_via_auto(
+            fetcher, canonical_url, known_feed_url, tz_name
+        )
+
+    async def _try_parse_feed_or_wp_response(
+        self,
+        resp: HttpFetchResponse,
+        *,
+        base_url: str,
+        tz_name: str,
+    ) -> Optional[FetchBatchResult]:
+        if resp.status_code != 200 or not resp.text:
+            return None
+
+        if is_feed_document(resp.text, resp.content_type):
+            title, posts = parse_feed_content(resp.text, base_url=base_url, tz_name=tz_name)
+            if posts:
+                return FetchBatchResult(
+                    site_title=title,
+                    posts=posts,
+                    source_mode="rss",
+                    discovered_feed_url=resp.url,
                 )
 
-        except CollectorError:
-            raise
-        except httpx.ProxyError as exc:
-            raise CollectorError(
-                f"خطا در اتصال به پروکسی تنظیم‌شده: {exc}. لطفاً آدرس و پورت پروکسی را در تنظیمات بررسی کنید."
-            ) from exc
-        except httpx.ConnectTimeout as exc:
-            raise CollectorError(
-                "مهلت زمانی اتصال به وب‌سایت به پایان رسید (Timeout). در صورت محدودیت شبکه، پروکسی یا مهلت زمانی را در تنظیمات بررسی کنید."
-            ) from exc
-        except httpx.ReadTimeout as exc:
-            raise CollectorError(
-                "وب‌سایت در زمان مقرر پاسخ نداد (Read Timeout)."
-            ) from exc
-        except httpx.ConnectError as exc:
-            err_str = str(exc)
-            if "SSL" in err_str.upper() or "CERTIFICATE" in err_str.upper():
-                raise CollectorError(
-                    "خطای گواهی امنیتی SSL در اتصال به وب‌سایت. می‌توانید در زبانه تنظیمات گزینه «بررسی گواهی SSL» را غیرفعال کنید."
-                ) from exc
-            raise CollectorError(
-                f"عدم دسترسی شبکه به وب‌سایت ({canonical_url}): {exc}"
-            ) from exc
-        except httpx.HTTPStatusError as exc:
-            raise CollectorError(
-                f"سرور وب‌سایت کد وضعیت ناموفق برگرداند (HTTP {exc.response.status_code})."
-            ) from exc
-        except Exception as exc:
-            raise CollectorError(f"خطای غیرمنتظره هنگام دریافت وب‌سایت: {exc}") from exc
+        if is_wp_posts_json(resp.text, resp.content_type):
+            title, posts = parse_wp_posts_json(resp.text, base_url=base_url, tz_name=tz_name)
+            if posts:
+                return FetchBatchResult(
+                    site_title=title,
+                    posts=posts,
+                    source_mode="wp_api",
+                    discovered_feed_url=resp.url,
+                )
+
+        return None
+
+    async def _probe_candidate_endpoints(
+        self,
+        fetcher: SmartHttpFetcher,
+        candidates: List[str],
+        *,
+        base_url: str,
+        tz_name: str,
+    ) -> Optional[FetchBatchResult]:
+        origin = _origin_of(base_url)
+        seen = set()
+        for candidate in candidates:
+            if not candidate or candidate in seen:
+                continue
+            seen.add(candidate)
+            accept_kind = "json" if "/wp-json/" in candidate else "document"
+            try:
+                resp = await fetcher.get(candidate, accept_kind=accept_kind, referer=origin)
+                parsed = await self._try_parse_feed_or_wp_response(
+                    resp, base_url=base_url, tz_name=tz_name
+                )
+                if parsed is not None:
+                    return parsed
+            except CollectorError:
+                continue
+        return None
+
+    def _build_blind_fallback_endpoints(self, url: str, *, is_root: bool) -> List[str]:
+        """Endpoints probed when homepage returns 403/503 or hides feed tags."""
+        endpoints: List[str] = []
+        base_slash = url.rstrip("/") + "/"
+        if is_root:
+            for suffix in COMMON_ROOT_FEED_PATHS:
+                endpoints.append(urljoin(base_slash, suffix.lstrip("/")))
+            origin = _origin_of(url)
+            endpoints.append(urljoin(origin, "wp-json/wp/v2/posts?per_page=20&_embed=1"))
+        else:
+            # WordPress & Ghost section feeds: https://site.com/section/feed/
+            endpoints.append(urljoin(base_slash, "feed/"))
+            endpoints.append(urljoin(base_slash, "rss"))
+        return endpoints
 
     async def _fetch_via_html(
         self,
-        client: httpx.AsyncClient,
+        fetcher: SmartHttpFetcher,
         canonical_url: str,
         tz_name: str,
     ) -> FetchBatchResult:
-        resp = await client.get(canonical_url)
+        resp = await fetcher.get(canonical_url)
         resp.raise_for_status()
-        final_url = str(resp.url)
 
-        # Even in HTML mode, if the user explicitly registered an XML feed URL, handle it cleanly
-        if is_feed_document(resp.text, resp.headers.get("content-type", "")):
-            title, posts = parse_feed_content(resp.text, base_url=final_url, tz_name=tz_name)
-            return FetchBatchResult(
-                site_title=title,
-                posts=posts,
-                source_mode="rss",
-                discovered_feed_url=final_url,
-            )
+        direct = await self._try_parse_feed_or_wp_response(
+            resp, base_url=resp.url, tz_name=tz_name
+        )
+        if direct is not None:
+            return direct
 
-        title, posts = extract_listing_posts(resp.text, page_url=final_url, tz_name=tz_name)
+        title, posts = extract_listing_posts(resp.text, page_url=resp.url, tz_name=tz_name)
         return FetchBatchResult(
             site_title=title,
             posts=posts,
@@ -153,63 +184,45 @@ class WebSiteCollector:
 
     async def _fetch_via_rss_strict(
         self,
-        client: httpx.AsyncClient,
+        fetcher: SmartHttpFetcher,
         canonical_url: str,
         known_feed_url: Optional[str],
         tz_name: str,
     ) -> FetchBatchResult:
-        # 1. Try known feed URL first
         if known_feed_url:
-            resp = await client.get(known_feed_url)
-            if resp.status_code == 200 and is_feed_document(
-                resp.text, resp.headers.get("content-type", "")
-            ):
-                title, posts = parse_feed_content(resp.text, base_url=canonical_url, tz_name=tz_name)
-                if posts:
-                    return FetchBatchResult(
-                        site_title=title,
-                        posts=posts,
-                        source_mode="rss",
-                        discovered_feed_url=str(resp.url),
-                    )
-
-        # 2. Fetch main URL
-        resp = await client.get(canonical_url)
-        resp.raise_for_status()
-        final_url = str(resp.url)
-
-        if is_feed_document(resp.text, resp.headers.get("content-type", "")):
-            title, posts = parse_feed_content(resp.text, base_url=final_url, tz_name=tz_name)
-            return FetchBatchResult(
-                site_title=title,
-                posts=posts,
-                source_mode="rss",
-                discovered_feed_url=final_url,
+            res = await self._probe_candidate_endpoints(
+                fetcher, [known_feed_url], base_url=canonical_url, tz_name=tz_name
             )
+            if res is not None:
+                return res
 
-        # 3. Discover feed links in HTML <head> + common feed endpoints
-        candidates = discover_feed_urls_in_html(resp.text, final_url, section_strict=False)
-        for suffix in COMMON_ROOT_FEED_PATHS:
-            probe_url = urljoin(final_url.rstrip("/") + "/", suffix.lstrip("/"))
-            if probe_url not in candidates:
-                candidates.append(probe_url)
+        resp = await fetcher.get(canonical_url)
+        final_url = resp.url or canonical_url
+        is_root = _is_root_like_url(final_url)
 
-        for feed_candidate in candidates[:6]:
-            try:
-                f_resp = await client.get(feed_candidate)
-            except httpx.HTTPError:
-                continue
-            if f_resp.status_code == 200 and is_feed_document(
-                f_resp.text, f_resp.headers.get("content-type", "")
-            ):
-                title, posts = parse_feed_content(f_resp.text, base_url=final_url, tz_name=tz_name)
-                if posts:
-                    return FetchBatchResult(
-                        site_title=title,
-                        posts=posts,
-                        source_mode="rss",
-                        discovered_feed_url=str(f_resp.url),
-                    )
+        if resp.status_code == 200:
+            direct = await self._try_parse_feed_or_wp_response(
+                resp, base_url=final_url, tz_name=tz_name
+            )
+            if direct is not None:
+                return direct
+
+            candidates = discover_feed_urls_in_html(resp.text, final_url, section_strict=not is_root)
+        else:
+            candidates = []
+
+        for ep in self._build_blind_fallback_endpoints(final_url, is_root=is_root):
+            if "/wp-json/" not in ep and ep not in candidates:
+                candidates.append(ep)
+
+        found = await self._probe_candidate_endpoints(
+            fetcher, candidates[:7], base_url=final_url, tz_name=tz_name
+        )
+        if found is not None:
+            return found
+
+        if resp.status_code >= 400:
+            resp.raise_for_status()
 
         raise CollectorError(
             "فید RSS یا Atom برای این وب‌سایت یافت نشد. در زبانه تنظیمات حالت دریافت را روی «هوشمند ترکیبی» یا «خزشگر HTML» قرار دهید."
@@ -217,74 +230,70 @@ class WebSiteCollector:
 
     async def _fetch_via_auto(
         self,
-        client: httpx.AsyncClient,
+        fetcher: SmartHttpFetcher,
         canonical_url: str,
         known_feed_url: Optional[str],
         tz_name: str,
     ) -> FetchBatchResult:
-        # 1. If we already discovered/stored a feed URL for this site, try it directly!
-        if known_feed_url or looks_like_feed_url(canonical_url):
-            target_feed = known_feed_url or canonical_url
-            try:
-                f_resp = await client.get(target_feed)
-                if f_resp.status_code == 200 and is_feed_document(
-                    f_resp.text, f_resp.headers.get("content-type", "")
-                ):
-                    title, posts = parse_feed_content(
-                        f_resp.text, base_url=canonical_url, tz_name=tz_name
-                    )
-                    if posts:
-                        return FetchBatchResult(
-                            site_title=title,
-                            posts=posts,
-                            source_mode="rss",
-                            discovered_feed_url=str(f_resp.url),
-                        )
-            except (httpx.HTTPError, CollectorError):
-                if looks_like_feed_url(canonical_url) and not known_feed_url:
-                    raise
+        # 1. Try previously discovered feed/API endpoint or explicit feed URL first
+        if known_feed_url or looks_like_feed_url(canonical_url) or "/wp-json/" in canonical_url:
+            target = known_feed_url or canonical_url
+            accept_kind = "json" if "/wp-json/" in target else "document"
+            resp = await fetcher.get(target, accept_kind=accept_kind, referer=_origin_of(canonical_url))
+            direct = await self._try_parse_feed_or_wp_response(
+                resp, base_url=canonical_url, tz_name=tz_name
+            )
+            if direct is not None:
+                return direct
+            if (looks_like_feed_url(canonical_url) or "/wp-json/" in canonical_url) and not known_feed_url:
+                resp.raise_for_status()
 
-        # 2. Fetch the target page
-        resp = await client.get(canonical_url)
-        resp.raise_for_status()
-        final_url = str(resp.url)
-        ctype = resp.headers.get("content-type", "")
-
-        if is_feed_document(resp.text, ctype):
-            title, posts = parse_feed_content(resp.text, base_url=final_url, tz_name=tz_name)
-            if posts:
-                return FetchBatchResult(
-                    site_title=title,
-                    posts=posts,
-                    source_mode="rss",
-                    discovered_feed_url=final_url,
-                )
-
-        # 3. Check if HTML <head> advertises a matching RSS/Atom feed
+        # 2. Fetch the main target URL
+        resp = await fetcher.get(canonical_url)
+        final_url = resp.url or canonical_url
         is_root = _is_root_like_url(final_url)
+
+        # Anti-403 resilience: if the main HTML page is blocked by WAF (403/503),
+        # automatically probe /feed/, /rss.xml, and /wp-json/wp/v2/posts before failing!
+        if resp.status_code >= 400:
+            rescued = await self._probe_candidate_endpoints(
+                fetcher,
+                self._build_blind_fallback_endpoints(final_url, is_root=is_root),
+                base_url=final_url,
+                tz_name=tz_name,
+            )
+            if rescued is not None:
+                return rescued
+            resp.raise_for_status()
+
+        # 3. Direct feed or WP REST JSON document
+        direct = await self._try_parse_feed_or_wp_response(
+            resp, base_url=final_url, tz_name=tz_name
+        )
+        if direct is not None:
+            return direct
+
+        # 4. Check advertised <link rel="alternate"> feeds in HTML <head>
         discovered_feeds = discover_feed_urls_in_html(
             resp.text, final_url, section_strict=not is_root
         )
-        for feed_candidate in discovered_feeds[:3]:
-            try:
-                f_resp = await client.get(feed_candidate)
-                if f_resp.status_code == 200 and is_feed_document(
-                    f_resp.text, f_resp.headers.get("content-type", "")
-                ):
-                    title, posts = parse_feed_content(
-                        f_resp.text, base_url=final_url, tz_name=tz_name
-                    )
-                    if posts:
-                        return FetchBatchResult(
-                            site_title=title,
-                            posts=posts,
-                            source_mode="rss",
-                            discovered_feed_url=str(f_resp.url),
-                        )
-            except (httpx.HTTPError, CollectorError):
-                continue
 
-        # 4. Scrape HTML listing directly
+        # 5. Proactive WordPress / hidden-feed discovery (e.g. fdd.org hides <link type="rss+xml">!)
+        if not discovered_feeds and is_wordpress_html(resp.text):
+            base_slash = final_url.rstrip("/") + "/"
+            discovered_feeds.append(urljoin(base_slash, "feed/"))
+            wp_api_url = discover_wp_posts_api_url(resp.text, final_url, is_root=is_root)
+            if wp_api_url:
+                discovered_feeds.append(wp_api_url)
+
+        if discovered_feeds:
+            found = await self._probe_candidate_endpoints(
+                fetcher, discovered_feeds[:4], base_url=final_url, tz_name=tz_name
+            )
+            if found is not None:
+                return found
+
+        # 6. Scrape HTML listing directly
         try:
             title, posts = extract_listing_posts(resp.text, page_url=final_url, tz_name=tz_name)
             return FetchBatchResult(
@@ -294,27 +303,15 @@ class WebSiteCollector:
                 discovered_feed_url=None,
             )
         except CollectorError:
-            # Last-resort fallback on root sites (e.g., SPA frontpage that still exposes /feed or /rss)
-            if is_root:
-                for suffix in COMMON_ROOT_FEED_PATHS:
-                    probe_url = urljoin(final_url.rstrip("/") + "/", suffix.lstrip("/"))
-                    try:
-                        f_resp = await client.get(probe_url)
-                        if f_resp.status_code == 200 and is_feed_document(
-                            f_resp.text, f_resp.headers.get("content-type", "")
-                        ):
-                            title, posts = parse_feed_content(
-                                f_resp.text, base_url=final_url, tz_name=tz_name
-                            )
-                            if posts:
-                                return FetchBatchResult(
-                                    site_title=title,
-                                    posts=posts,
-                                    source_mode="rss",
-                                    discovered_feed_url=str(f_resp.url),
-                                )
-                    except (httpx.HTTPError, CollectorError):
-                        continue
+            # 7. Last-resort fallback for JS/SPA homepages: probe common feeds + WP REST API
+            rescued = await self._probe_candidate_endpoints(
+                fetcher,
+                self._build_blind_fallback_endpoints(final_url, is_root=is_root),
+                base_url=final_url,
+                tz_name=tz_name,
+            )
+            if rescued is not None:
+                return rescued
             raise
 
     async def enrich_posts_with_full_content(
@@ -336,37 +333,36 @@ class WebSiteCollector:
 
         tz_name = settings.get("timezone") or DEFAULT_TIMEZONE
         sem = asyncio.Semaphore(self.MAX_CONCURRENT_ARTICLE_FETCHES)
+        fetcher = SmartHttpFetcher(settings)
 
-        async with httpx.AsyncClient(**self._client_kwargs(settings)) as client:
-
-            async def _enrich_one(post: FetchedPost) -> None:
-                async with sem:
-                    try:
-                        resp = await client.get(post.post_url)
-                        if resp.status_code != 200:
-                            return
-                        details = extract_article_details(
-                            resp.text, article_url=str(resp.url), tz_name=tz_name
-                        )
-                        if details.get("title") and (
-                            not post.title or len(str(details["title"])) > len(post.title)
-                        ):
-                            post.title = str(details["title"])[:300]
-                        if details.get("published_at") and post.published_at is None:
-                            post.published_at = details["published_at"]
-                        full_body = str(details.get("content") or "").strip()
-                        if full_body and len(full_body) > len(post.content):
-                            post.content = full_body
-                        if details.get("media_type") and post.media_type == "text":
-                            post.media_type = str(details["media_type"])
-                        if details.get("media_url") and not post.media_url:
-                            post.media_url = str(details["media_url"])
-                    except Exception:
-                        # Keep existing summary/headline if article page couldn't be fetched
+        async def _enrich_one(post: FetchedPost) -> None:
+            async with sem:
+                try:
+                    resp = await fetcher.get(
+                        post.post_url, referer=_origin_of(post.post_url)
+                    )
+                    if resp.status_code != 200:
                         return
+                    details = extract_article_details(
+                        resp.text, article_url=resp.url, tz_name=tz_name
+                    )
+                    if details.get("title") and (
+                        not post.title or len(str(details["title"])) > len(post.title)
+                    ):
+                        post.title = str(details["title"])[:300]
+                    if details.get("published_at") and post.published_at is None:
+                        post.published_at = details["published_at"]
+                    full_body = str(details.get("content") or "").strip()
+                    if full_body and len(full_body) > len(post.content):
+                        post.content = full_body
+                    if details.get("media_type") and post.media_type == "text":
+                        post.media_type = str(details["media_type"])
+                    if details.get("media_url") and not post.media_url:
+                        post.media_url = str(details["media_url"])
+                except Exception:
+                    return
 
-            await asyncio.gather(*(_enrich_one(p) for p in targets))
-
+        await asyncio.gather(*(_enrich_one(p) for p in targets))
         return posts
 
     async def probe_site(

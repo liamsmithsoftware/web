@@ -8,7 +8,7 @@ from urllib.parse import quote
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/128.0.0.0 Safari/537.36"
+    "Chrome/131.0.0.0 Safari/537.36"
 )
 
 
@@ -30,7 +30,7 @@ class FetchedPost:
 class FetchBatchResult:
     site_title: Optional[str]
     posts: List[FetchedPost]  # Ordered newest -> oldest as listed on website/feed
-    source_mode: str  # 'rss' | 'html'
+    source_mode: str  # 'rss' | 'html' | 'wp_api'
     discovered_feed_url: Optional[str] = None
 
 
@@ -60,16 +60,50 @@ def build_httpx_proxy_url(settings: Dict[str, str]) -> Optional[str]:
     return f"{scheme}://{auth}{host}:{port}"
 
 
-def build_request_headers(settings: Dict[str, str]) -> Dict[str, str]:
-    ua = (settings.get("custom_user_agent") or "").strip() or DEFAULT_USER_AGENT
+def build_request_headers(
+    settings: Dict[str, str],
+    *,
+    referer: Optional[str] = None,
+    accept_kind: str = "document",
+) -> Dict[str, str]:
+    custom_ua = (settings.get("custom_user_agent") or "").strip()
+    ua = custom_ua or DEFAULT_USER_AGENT
+
+    if accept_kind == "feed":
+        accept_value = (
+            "application/rss+xml,application/atom+xml,application/xml;q=0.9,"
+            "text/xml;q=0.8,application/json;q=0.7,*/*;q=0.5"
+        )
+    elif accept_kind == "json":
+        accept_value = "application/json,text/plain;q=0.9,*/*;q=0.8"
+    else:
+        # Standard Chrome navigation Accept header (avoids triggering WAF bot rules)
+        accept_value = (
+            "text/html,application/xhtml+xml,application/xml;q=0.9,"
+            "image/avif,image/webp,image/apng,*/*;q=0.8"
+        )
+
     headers: Dict[str, str] = {
         "User-Agent": ua,
-        "Accept": (
-            "text/html,application/xhtml+xml,application/rss+xml,"
-            "application/atom+xml,application/xml;q=0.9,*/*;q=0.8"
-        ),
-        "Accept-Language": "fa-IR,fa;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Accept": accept_value,
+        "Accept-Language": "en-US,en;q=0.9,fa-IR;q=0.8,fa;q=0.7",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document" if accept_kind == "document" else "empty",
+        "Sec-Fetch-Mode": "navigate" if accept_kind == "document" else "cors",
+        "Sec-Fetch-Site": "same-origin" if referer else "none",
     }
+    if accept_kind == "document":
+        headers["Sec-Fetch-User"] = "?1"
+    if not custom_ua:
+        headers["Sec-Ch-Ua"] = '"Chromium";v="131", "Not_A Brand";v="24", "Google Chrome";v="131"'
+        headers["Sec-Ch-Ua-Mobile"] = "?0"
+        headers["Sec-Ch-Ua-Platform"] = '"Windows"'
+
+    if referer:
+        headers["Referer"] = referer
+
     cookie = (settings.get("custom_cookie") or "").strip()
     if cookie:
         headers["Cookie"] = cookie
