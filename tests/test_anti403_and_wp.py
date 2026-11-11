@@ -993,3 +993,305 @@ async def test_turnstile_oopif_auto_attach_and_persistent_profile():
     ) is True
 
 
+MEI_CUSTOM_POST_TYPES_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+    <title>Home - Middle East Institute</title>
+    <link rel="alternate" type="application/rss+xml" title="MEI Feed" href="https://mei.edu/feed/" />
+    <link rel="https://api.w.org/" href="https://mei.edu/wp-json/" />
+</head>
+<body>
+    <main>
+        <div class="card">
+            <h3><a href="https://mei.edu/report/a-contested-mediterranean-what-role-for-the-us/">A Contested Mediterranean: What Role for the US?</a></h3>
+            <p>This report explores maritime security conditions in the Mediterranean and US engagement.</p>
+        </div>
+        <div class="card">
+            <h3><a href="https://mei.edu/publication/mohsen-rezaei-the-unlikely-peacemaker/">Mohsen Rezaei: The Unlikely Peacemaker</a></h3>
+        </div>
+        <div class="card">
+            <h3><a href="https://mei.edu/podcast/ambassador-talal-al-rahbi-on-omans-diplomacy/">Ambassador Talal Al Rahbi on Oman's Diplomacy</a></h3>
+        </div>
+        <a href="https://mei.edu/research-commentary/">See More Research &amp; Commentary</a>
+        <a href="https://mei.edu/person/karen-e-young/">Karen E. Young</a>
+        <a href="https://mei.edu/regions/gulf/united-arab-emirates/">United Arab Emirates (UAE)</a>
+    </main>
+</body>
+</html>
+"""
+
+IPIS_PORTAL_HTML = """<!DOCTYPE html>
+<html lang="fa">
+<head><title>مرکز مطالعات سیاسی و بین المللی</title></head>
+<body>
+    <div class="slider-item">
+        <a href="https://ipis.ir/portal/subjectview/796883">
+            <img src="https://ipis.ir/files/mfaipis/newspics/2026103115010867278451362.jpg" alt="" />
+        </a>
+        <a href="https://ipis.ir/portal/subjectview/796883">
+            دیدار هیات کمیته بین‌المللی صلیب سرخ با معاون پژوهشی مرکز مطالعات سیاسی و بین‌المللی
+        </a>
+    </div>
+    <div class="slider-item">
+        <a href="https://ipis.ir/portal/subjectview/797397">
+            <img src="https://ipis.ir/files/mfaipis/newspics/2026110916111798475416238.jpg" alt="" />
+        </a>
+        <a href="https://ipis.ir/portal/subjectview/797397">
+            غرب آسیای جدید در برابر خاورمیانه جدید؛ توافق مکه و آزمون گذار به معماری امنیتی فراگیر
+        </a>
+    </div>
+    <a href="https://ipis.ir/portal/NewsAgencyShow/3001">آرشیو</a>
+    <div class="eurasia-item">
+        <a href="https://ipis.ir/portal/subjectview/774932">
+            <img src="https://ipis.ir/files/mfaipis/newspics/cr_2025091412255674646271385.jpg" alt="" />
+        </a>
+        <a href="https://ipis.ir/portal/subjectview/774932">
+            گذار نظم کهن به نظم جدید از گذرگاه جنگ اوکراین
+        </a>
+    </div>
+</body>
+</html>
+"""
+
+
+async def test_mei_wordpress_hello_world_placeholder_skipped_for_custom_post_types(monkeypatch):
+    hello_rss = """<?xml version="1.0" encoding="UTF-8"?>
+    <rss version="2.0"><channel><title>Middle East Institute</title>
+        <item>
+            <title>Hello world!</title>
+            <link>https://mei.edu/hello-world/</link>
+            <pubDate>Mon, 05 May 2025 18:41:22 +0000</pubDate>
+            <description>Welcome to WordPress. This is your first post. Edit or delete it, then start writing!</description>
+        </item>
+    </channel></rss>"""
+
+    hello_wp_json = (
+        '[{"id":1,"date_gmt":"2025-05-05T18:41:22","slug":"hello-world",'
+        '"link":"https://mei.edu/hello-world/","title":{"rendered":"Hello world!"},'
+        '"content":{"rendered":"<p>Welcome to WordPress. This is your first post.</p>"},'
+        '"excerpt":{"rendered":"<p>Welcome to WordPress.</p>"}}]'
+    )
+
+    async def _mock_get(self, url, **kwargs):
+        if "mei.edu/feed" in url:
+            return HttpFetchResponse(
+                url="https://mei.edu/feed/",
+                status_code=200,
+                text=hello_rss,
+                headers={"content-type": "application/rss+xml"},
+            )
+        if "mei.edu/wp-json/wp/v2/posts" in url:
+            return HttpFetchResponse(
+                url=url,
+                status_code=200,
+                text=hello_wp_json,
+                headers={"content-type": "application/json"},
+            )
+        if "mei.edu" in url:
+            return HttpFetchResponse(
+                url="https://mei.edu/",
+                status_code=200,
+                text=MEI_CUSTOM_POST_TYPES_HTML,
+                headers={"content-type": "text/html; charset=utf-8"},
+            )
+        return HttpFetchResponse(url=url, status_code=404, text="not found", headers={})
+
+    monkeypatch.setattr(SmartHttpFetcher, "get", _mock_get)
+    collector = WebSiteCollector()
+    batch = await collector.fetch_site_posts(
+        site={"canonical_url": "http://www.mei.edu/"},
+        settings=dict(DEFAULT_SETTINGS),
+    )
+    assert batch.source_mode == "html"
+    urls = [p.post_url for p in batch.posts]
+    assert len(batch.posts) == 3
+    assert all("hello-world" not in u for u in urls)
+    assert all("/person/" not in u and "/regions/" not in u for u in urls)
+    assert batch.posts[0].title == "A Contested Mediterranean: What Role for the US?"
+
+
+async def test_war_gov_afpims_rss_ashx_discovery_and_known_feeds(monkeypatch):
+    from app.collectors.feed_parser import discover_feed_urls_in_html
+    from app.collectors.web_collector import _resolve_known_public_feeds
+
+    war_feeds = _resolve_known_public_feeds("https://www.war.gov")
+    assert "https://www.war.gov/DesktopModules/ArticleCS/RSS.ashx?max=20&ContentType=1&Site=945" in war_feeds
+    assert _resolve_known_public_feeds("https://www.war.gov/News/Speeches") == [
+        "https://www.war.gov/DesktopModules/ArticleCS/RSS.ashx?max=20&ContentType=11&Site=945"
+    ]
+
+    afpims_rss_page = (
+        '<html><body><a href="/DesktopModules/ArticleCS/RSS.ashx?max=10&amp;ContentType=1&amp;Site=945">'
+        "News RSS</a></body></html>"
+    )
+    discovered = discover_feed_urls_in_html(afpims_rss_page, "https://www.war.gov/News/RSS/")
+    assert discovered == ["https://www.war.gov/DesktopModules/ArticleCS/RSS.ashx?max=10&ContentType=1&Site=945"]
+
+    war_rss_xml = """<?xml version="1.0" encoding="utf-8"?>
+    <rss version="2.0"><channel><title>Department of War News Feed</title>
+        <item>
+            <title>USS Nimitz Trains New, Returning Naval Aviators</title>
+            <link>https://www.war.gov/News/News-Stories/Article/Article/4646092/uss-nimitz-trains-new-returning-naval-aviators/</link>
+            <pubDate>Tue, 10 Nov 2026 19:40:06 GMT</pubDate>
+            <description>Carrier qualifications completed in the Atlantic.</description>
+        </item>
+    </channel></rss>"""
+
+    async def _mock_get(self, url, **kwargs):
+        if "RSS.ashx" in url:
+            return HttpFetchResponse(
+                url=url,
+                status_code=200,
+                text=war_rss_xml,
+                headers={"content-type": "application/rss+xml"},
+            )
+        return HttpFetchResponse(
+            url=url,
+            status_code=403,
+            text="<html><title>Access Denied</title><body>Reference #18.1a.edgesuite.net</body></html>",
+            headers={"content-type": "text/html"},
+        )
+
+    monkeypatch.setattr(SmartHttpFetcher, "get", _mock_get)
+    collector = WebSiteCollector()
+    batch = await collector.fetch_site_posts(
+        site={"canonical_url": "https://www.war.gov"},
+        settings=dict(DEFAULT_SETTINGS),
+    )
+    assert batch.source_mode == "rss"
+    assert len(batch.posts) == 1
+    assert batch.posts[0].title == "USS Nimitz Trains New, Returning Naval Aviators"
+
+
+def test_ipis_ir_direct_first_routing_and_newspics_timestamp_sorting(monkeypatch):
+    monkeypatch.setattr(
+        "urllib.request.getproxies",
+        lambda: {"http": "socks5://127.0.0.1:10808", "https": "socks5://127.0.0.1:10808"},
+    )
+    # Domestic .ir sites try Direct `(None, False)` first so foreign VPN IPs don't hang/block on MFA firewalls
+    ir_cands = resolve_proxy_candidates(dict(DEFAULT_SETTINGS), "https://ipis.ir/")
+    assert ir_cands == [(None, False), ("socks5://127.0.0.1:10808", False)]
+
+    # International sites still try the VPN proxy first
+    intl_cands = resolve_proxy_candidates(dict(DEFAULT_SETTINGS), "https://www.criticalthreats.org/")
+    assert intl_cands == [("socks5://127.0.0.1:10808", False), (None, False)]
+
+    title, posts = extract_listing_posts(IPIS_PORTAL_HTML, page_url="https://ipis.ir/", tz_name="UTC")
+    assert title == "مرکز مطالعات سیاسی و بین المللی"
+    assert len(posts) == 3
+    assert all("NewsAgencyShow" not in p.post_url for p in posts)
+    # Sorted newest-first using embedded `newspics/YYYYMMDDHHMMSS...jpg` timestamps!
+    assert [p.post_url for p in posts] == [
+        "https://ipis.ir/portal/subjectview/797397",
+        "https://ipis.ir/portal/subjectview/796883",
+        "https://ipis.ir/portal/subjectview/774932",
+    ]
+    assert posts[0].published_at == datetime(2026, 11, 9, 16, 11, 17, tzinfo=timezone.utc)
+
+
+async def test_bicom_wp_json_fallback_and_turnstile_backend_node_clicker(monkeypatch):
+    from app.collectors.browser_fetcher import DomainClearanceCache, _nudge_turnstile_if_present
+
+    # 1. WordPress site (`bicom.org.uk`) where `<head>` advertises `/feed/` (blocked 403),
+    #    automatically discovers and rescues via `/wp-json/wp/v2/posts`!
+    bicom_html = """<!DOCTYPE html><html><head>
+        <title>BICOM</title>
+        <link rel="alternate" type="application/rss+xml" href="https://www.bicom.org.uk/feed/" />
+        <link rel="https://api.w.org/" href="https://www.bicom.org.uk/wp-json/" />
+    </head><body class="home wp-singular"><img src="/wp-content/uploads/hero.jpg"/></body></html>"""
+
+    bicom_wp_json = (
+        '[{"id":8020,"date_gmt":"2026-11-11T12:02:19","slug":"eisenkots-bloc-moves-to-take-control",'
+        '"link":"https://www.bicom.org.uk/eisenkots-bloc-moves-to-take-control/",'
+        '"title":{"rendered":"Eisenkot bloc moves to take control of the Knesset"},'
+        '"content":{"rendered":"<p>The 26th Knesset convened in Jerusalem for its opening session.</p>"},'
+        '"excerpt":{"rendered":"<p>Opening session briefing.</p>"}}]'
+    )
+
+    async def _mock_get(self, url, **kwargs):
+        if url.rstrip("/") == "https://www.bicom.org.uk":
+            return HttpFetchResponse(
+                url="https://www.bicom.org.uk/",
+                status_code=200,
+                text=bicom_html,
+                headers={"content-type": "text/html; charset=utf-8"},
+            )
+        if "/feed" in url:
+            return HttpFetchResponse(url=url, status_code=403, text="Forbidden", headers={})
+        if "/wp-json/wp/v2/posts" in url:
+            return HttpFetchResponse(
+                url=url,
+                status_code=200,
+                text=bicom_wp_json,
+                headers={"content-type": "application/json"},
+            )
+        return HttpFetchResponse(url=url, status_code=404, text="not found", headers={})
+
+    monkeypatch.setattr(SmartHttpFetcher, "get", _mock_get)
+    collector = WebSiteCollector()
+    batch = await collector.fetch_site_posts(
+        site={"canonical_url": "http://www.bicom.org.uk/"},
+        settings=dict(DEFAULT_SETTINGS),
+    )
+    assert batch.source_mode == "wp_api"
+    assert len(batch.posts) == 1
+    assert "Eisenkot" in batch.posts[0].title
+
+    # 2. Turnstile checkbox clicker uses `backendNodeId` (even when `nodeId == 0` inside closed Shadow DOM!)
+    cdp_calls = []
+
+    class _FakeTurnstileCdp:
+        async def call(self, method: str, params=None, timeout: float = 2.0):
+            cdp_calls.append((method, params or {}))
+            if method == "DOM.getFlattenedDocument":
+                return {
+                    "nodes": [
+                        {
+                            "nodeId": 0,
+                            "backendNodeId": 77,
+                            "nodeName": "IFRAME",
+                            "attributes": [
+                                "src",
+                                "https://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/g/turnstile/f",
+                                "title",
+                                "Widget containing a Cloudflare security challenge",
+                            ],
+                        }
+                    ]
+                }
+            if method == "DOM.getBoxModel":
+                assert params == {"backendNodeId": 77}
+                return {"model": {"content": [200, 300, 500, 300, 500, 365, 200, 365]}}
+            return {}
+
+    await _nudge_turnstile_if_present(_FakeTurnstileCdp())  # type: ignore[arg-type]
+    pressed = [p for m, p in cdp_calls if m == "Input.dispatchMouseEvent" and p.get("type") == "mousePressed"]
+    assert len(pressed) == 1
+    assert pressed[0]["x"] == 228 and pressed[0]["y"] == 332
+
+    # 3. DomainClearanceCache preserves full HttpOnly / Secure CDP cookies
+    cache = DomainClearanceCache()
+    cache.put(
+        "https://www.criticalthreats.org/",
+        None,
+        cookie_header="cf_clearance=abc123",
+        user_agent="Mozilla/5.0 Chrome/131.0.0.0",
+        cdp_cookies=[
+            {
+                "name": "cf_clearance",
+                "value": "abc123",
+                "domain": ".criticalthreats.org",
+                "path": "/",
+                "secure": True,
+                "httpOnly": True,
+                "sameSite": "None",
+            }
+        ],
+    )
+    entry = cache.get("https://www.criticalthreats.org/analysis", None)
+    assert entry is not None
+    assert entry.cdp_cookies[0]["httpOnly"] is True
+    assert entry.cdp_cookies[0]["domain"] == ".criticalthreats.org"
+
+
+

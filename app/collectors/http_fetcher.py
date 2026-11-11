@@ -39,11 +39,12 @@ CHROME_LIKE_CIPHERS = (
     "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:"
     "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:"
     "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:"
-    "ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305"
+    "ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:"
+    "AES128-GCM-SHA256:AES256-GCM-SHA384:AES128-SHA:AES256-SHA"
 )
 
 WAF_CHALLENGE_STATUSES = {401, 403, 406, 429, 503}
-CLOUDFLARE_ORIGIN_DOWN_STATUSES = {520, 521, 522, 523, 524, 525, 526}
+CLOUDFLARE_ORIGIN_DOWN_STATUSES = {502, 504, 520, 521, 522, 523, 524, 525, 526}
 
 WAF_BODY_MARKERS = (
     "just a moment...",
@@ -53,6 +54,10 @@ WAF_BODY_MARKERS = (
     "enable javascript and cookies to continue",
     "sucuri website firewall",
     "access denied |",
+    "<title>access denied</title>",
+    "edgesuite.net",
+    "reference #18.",
+    "arvancloud",
 )
 
 
@@ -127,6 +132,11 @@ def detect_os_system_proxy() -> Optional[str]:
     return None
 
 
+def _is_domestic_ir_target(url: str) -> bool:
+    host = (urlparse(url).hostname or "").lower().rstrip(".")
+    return host.endswith(".ir")
+
+
 def resolve_proxy_candidates(
     settings: Dict[str, str],
     target_url: str,
@@ -134,22 +144,27 @@ def resolve_proxy_candidates(
     """
     Returns ordered list of (proxy_url, is_explicit_user_proxy).
     - Never uses a proxy for localhost / 127.0.0.1 targets.
-    - If user explicitly configured a proxy in Settings, uses it as primary AND keeps
-      direct connection (`None`) as secondary rescue ONLY when the proxy IP itself is
-      blocked by Cloudflare/origin (403 / 520..526).
-    - If an OS/Windows System Proxy is active, tries the System Proxy first and falls
-      back to direct connection (`None`) on network failure or 403/522 block.
+    - For domestic `.ir` sites (e.g. `ipis.ir`, `mfa.gov.ir`, `isna.ir`), tries direct
+      connection (`None`) FIRST because Iranian ministry/domestic firewalls frequently
+      drop or block foreign VPN IPs, keeping the proxy as secondary fallback.
+    - For international sites: tries explicit/OS proxy first and falls back to direct (`None`).
     """
     if _is_loopback_target(target_url):
         return [(None, False)]
 
+    is_ir = _is_domestic_ir_target(target_url)
+
     explicit = build_httpx_proxy_url(settings)
     if explicit:
+        if is_ir:
+            return [(None, False), (explicit, True)]
         return [(explicit, True)]
 
     if settings.get("use_system_proxy", "1") != "0":
         sys_proxy = detect_os_system_proxy()
         if sys_proxy:
+            if is_ir:
+                return [(None, False), (sys_proxy, False)]
             return [(sys_proxy, False), (None, False)]
 
     return [(None, False)]
@@ -166,10 +181,19 @@ def _to_curl_proxy(proxy_url: Optional[str]) -> Optional[str]:
 
 def _build_ssl_context(verify_ssl: bool) -> ssl.SSLContext | bool:
     if not verify_ssl:
-        return False
+        try:
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            ctx.set_ciphers("DEFAULT:@SECLEVEL=1")
+            ctx.options |= getattr(ssl, "OP_LEGACY_SERVER_CONNECT", 0)
+            return ctx
+        except Exception:
+            return False
     try:
         ctx = ssl.create_default_context()
         ctx.set_ciphers(CHROME_LIKE_CIPHERS)
+        ctx.options |= getattr(ssl, "OP_LEGACY_SERVER_CONNECT", 0)
         return ctx
     except Exception:
         return True

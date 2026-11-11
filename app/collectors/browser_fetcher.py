@@ -85,6 +85,12 @@ STEALTH_INIT_SCRIPT = """
         if (!window.outerHeight || window.outerHeight === 0) {
             Object.defineProperty(window, 'outerHeight', { get: () => (window.innerHeight || 720) + 68, configurable: true });
         }
+        if (window.screenX < 0 || window.screenY < 0) {
+            Object.defineProperty(window, 'screenX', { get: () => 80, configurable: true });
+            Object.defineProperty(window, 'screenLeft', { get: () => 80, configurable: true });
+            Object.defineProperty(window, 'screenY', { get: () => 80, configurable: true });
+            Object.defineProperty(window, 'screenTop', { get: () => 80, configurable: true });
+        }
         if (!navigator.languages || navigator.languages.length === 0) {
             Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'], configurable: true });
         }
@@ -103,6 +109,7 @@ class ClearanceEntry:
     user_agent: str
     expires_at: float
     via_browser: bool = True
+    cdp_cookies: Tuple[Dict[str, Any], ...] = ()
 
 
 class DomainClearanceCache:
@@ -138,15 +145,35 @@ class DomainClearanceCache:
         cookie_header: str,
         user_agent: str,
         via_browser: bool = True,
+        cdp_cookies: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         domain = self._base_domain(url)
         if not domain or not cookie_header:
             return
+        sanitized_cdp: List[Dict[str, Any]] = []
+        for c in cdp_cookies or []:
+            if not isinstance(c, dict) or not c.get("name") or c.get("value") is None:
+                continue
+            item: Dict[str, Any] = {
+                "name": str(c["name"]),
+                "value": str(c["value"]),
+                "domain": str(c.get("domain") or domain),
+                "path": str(c.get("path") or "/"),
+                "secure": bool(c.get("secure", False)),
+                "httpOnly": bool(c.get("httpOnly", False)),
+            }
+            if c.get("sameSite") in ("Strict", "Lax", "None"):
+                item["sameSite"] = c["sameSite"]
+            if isinstance(c.get("expires"), (int, float)) and float(c["expires"]) > 0:
+                item["expires"] = float(c["expires"])
+            sanitized_cdp.append(item)
+
         self._store[(domain, proxy_url or "direct")] = ClearanceEntry(
             cookie_header=cookie_header,
             user_agent=user_agent,
             expires_at=time.time() + self.TTL_SECONDS,
             via_browser=via_browser,
+            cdp_cookies=tuple(sanitized_cdp),
         )
 
     def clear(self) -> None:
@@ -401,6 +428,7 @@ class _RawCdpClient:
         self.doc_headers: Dict[str, str] = {}
         self.doc_request_id: Optional[str] = None
         self.load_fired = asyncio.Event()
+        self.body_ready = asyncio.Event()
         self._reader_task = asyncio.create_task(self._reader_loop())
 
     async def _configure_child_target(self, session_id: str, waiting_for_debugger: bool) -> None:
@@ -475,6 +503,10 @@ class _RawCdpClient:
                             raw_hdrs = resp.get("headers") or {}
                             self.doc_headers = {str(k).lower(): str(v) for k, v in raw_hdrs.items()}
                             self.doc_request_id = str(params.get("requestId") or "") or None
+                            self.body_ready.clear()
+                elif method == "Network.loadingFinished":
+                    if self.doc_request_id and params.get("requestId") == self.doc_request_id:
+                        self.body_ready.set()
                 elif method == "Page.loadEventFired":
                     self.load_fired.set()
         except Exception:
@@ -518,6 +550,10 @@ class _RawCdpClient:
         if not self.doc_request_id:
             return None
         try:
+            try:
+                await asyncio.wait_for(self.body_ready.wait(), timeout=1.5)
+            except asyncio.TimeoutError:
+                pass
             res = await self.call("Network.getResponseBody", {"requestId": self.doc_request_id})
             body = res.get("body")
             if body is None:
@@ -542,7 +578,8 @@ async def _nudge_turnstile_if_present(cdp: _RawCdpClient) -> None:
     """
     Provides natural pointer movement entropy for Cloudflare Managed Challenges and, if an
     interactive Turnstile checkbox iframe or host wrapper is present (even inside closed Shadow DOM),
-    clicks its checkbox region. Uses ONLY Input & DOM CDP domains (never Runtime.enable).
+    clicks its checkbox region using `backendNodeId` (`DOM.getFlattenedDocument` sets `nodeId=0`
+    on unpushed child/shadow nodes!). Never invokes `Runtime.enable`.
     """
     try:
         for x, y in ((180, 220), (255, 270), (315, 305)):
@@ -555,7 +592,7 @@ async def _nudge_turnstile_if_present(cdp: _RawCdpClient) -> None:
 
         flat = await cdp.call("DOM.getFlattenedDocument", {"depth": -1, "pierce": True}, timeout=3.0)
         nodes = flat.get("nodes") or []
-        candidate_node_ids: List[int] = []
+        candidate_backend_ids: List[int] = []
 
         for node in nodes:
             if not isinstance(node, dict):
@@ -566,30 +603,36 @@ async def _nudge_turnstile_if_present(cdp: _RawCdpClient) -> None:
                 str(attrs[i]).lower(): str(attrs[i + 1])
                 for i in range(0, len(attrs) - 1, 2)
             }
-            nid = node.get("nodeId")
-            if not isinstance(nid, int):
+            backend_nid = node.get("backendNodeId")
+            if not isinstance(backend_nid, int) or backend_nid <= 0:
                 continue
 
             if n_name == "IFRAME":
                 src = attr_map.get("src", "").lower()
                 title = attr_map.get("title", "").lower()
                 elem_id = attr_map.get("id", "").lower()
+                elem_name = attr_map.get("name", "").lower()
                 if (
                     "challenges.cloudflare.com" in src
                     or "turnstile" in src
                     or "cf-chl-widget" in elem_id
+                    or "cf-turnstile" in elem_name
                     or "cloudflare security challenge" in title
                 ):
-                    candidate_node_ids.insert(0, nid)
-            elif n_name == "DIV":
+                    candidate_backend_ids.insert(0, backend_nid)
+            elif n_name in ("DIV", "LABEL", "INPUT"):
                 elem_id = attr_map.get("id", "").lower()
                 elem_cls = attr_map.get("class", "").lower()
-                if elem_id in ("turnstile-wrapper", "challenge-stage", "cf-turnstile") or "cf-turnstile" in elem_cls:
-                    candidate_node_ids.append(nid)
+                if (
+                    elem_id in ("turnstile-wrapper", "challenge-stage", "cf-turnstile")
+                    or "cf-turnstile" in elem_cls
+                    or "cb-lb" in elem_cls
+                ):
+                    candidate_backend_ids.append(backend_nid)
 
-        for target_nid in candidate_node_ids:
+        for target_backend_id in candidate_backend_ids:
             try:
-                box = await cdp.call("DOM.getBoxModel", {"nodeId": target_nid}, timeout=2.0)
+                box = await cdp.call("DOM.getBoxModel", {"backendNodeId": target_backend_id}, timeout=2.0)
                 content_quad = (box.get("model") or {}).get("content")
                 if not isinstance(content_quad, list) or len(content_quad) < 8:
                     continue
@@ -599,9 +642,9 @@ async def _nudge_turnstile_if_present(cdp: _RawCdpClient) -> None:
                 bottom_y = float(content_quad[5])
                 width = right_x - left_x
                 height = bottom_y - top_y
-                if width < 40 or height < 20:
+                if width < 18 or height < 18:
                     continue
-                click_x = int(left_x + 28)
+                click_x = int(left_x + min(28.0, width / 2.0))
                 click_y = int(top_y + min(34.0, height / 2.0))
                 await cdp.call(
                     "Input.dispatchMouseEvent",
@@ -654,7 +697,9 @@ async def _run_single_browser_attempt(
     timeout_sec: float,
 ) -> Optional[Dict[str, Any]]:
     debug_port = _pick_ephemeral_port()
-    profile_dir = _get_persistent_profile_dir(headless=headless, proxy_url=proxy_url)
+    # Isolated per-run profile avoids Windows `lockfile` / Edge Startup Boost collisions, while
+    # `DomainClearanceCache.cdp_cookies` preserves full HttpOnly/Secure cf_clearance cookies!
+    profile_dir = tempfile.mkdtemp(prefix="wcc_cdp_")
     proc: Optional[subprocess.Popen[bytes]] = None
     chromium_proxy = _normalize_chromium_proxy(proxy_url)
 
@@ -662,11 +707,11 @@ async def _run_single_browser_attempt(
     if headless:
         cmd.extend(["--headless=new", "--window-size=1366,768"])
     else:
-        # Unminimized off-screen window so `document.visibilityState === 'visible'` and
-        # `requestAnimationFrame` runs at full speed for Turnstile without stealing user focus!
+        # On-monitor window with SW_SHOWNOACTIVATE (avoids `-3200,-3200` off-monitor DWM occlusion
+        # and negative `window.screenX` Turnstile bot flags without stealing user focus!)
         cmd.extend(
             [
-                "--window-position=-3200,-3200",
+                "--window-position=80,80",
                 "--window-size=1280,800",
                 "--disable-background-timer-throttling",
                 "--disable-backgrounding-occluded-windows",
@@ -692,6 +737,12 @@ async def _run_single_browser_attempt(
         cmd.append("--ignore-certificate-errors")
     if chromium_proxy:
         cmd.extend([f"--proxy-server={chromium_proxy}", "--disable-quic"])
+        # Force Chromium's SOCKS5 client (e.g. v2rayN / Nekoray) to tunnel DNS remotely instead
+        # of querying poisoned local ISP DNS!
+        if chromium_proxy.lower().startswith("socks"):
+            cmd.append(
+                "--host-resolver-rules=MAP * ~NOTFOUND , EXCLUDE 127.0.0.1 , EXCLUDE localhost , EXCLUDE ::1"
+            )
     if os.name != "nt":
         cmd.extend(["--no-sandbox", "--disable-dev-shm-usage"])
     cmd.append("about:blank")
@@ -715,7 +766,7 @@ async def _run_single_browser_attempt(
 
         ws_url: Optional[str] = None
         raw_ua = ""
-        deadline = time.monotonic() + 7.5
+        deadline = time.monotonic() + 8.5
         while time.monotonic() < deadline:
             ver_info = await asyncio.to_thread(_http_get_local_json, debug_port, "/json/version")
             if isinstance(ver_info, dict):
@@ -739,9 +790,10 @@ async def _run_single_browser_attempt(
         async with ws_connect(ws_url, max_size=32 * 1024 * 1024) as ws:
             cdp = _RawCdpClient(ws, ua_override=ua_override)
             try:
+                # Do NOT call DOM.enable upfront before navigation so Blink's InspectorDOMAgent
+                # stays untouched while Turnstile's initial non-interactive verification runs!
                 await cdp.call("Network.enable")
                 await cdp.call("Page.enable")
-                await cdp.call("DOM.enable")
                 await cdp.call("Network.setUserAgentOverride", ua_override)
                 await cdp.call("Emulation.setUserAgentOverride", ua_override)
                 await cdp.call(
@@ -756,6 +808,17 @@ async def _run_single_browser_attempt(
                     )
                 except Exception:
                     pass
+
+                # Restore full HttpOnly/Secure/SameSite CDP cookies from prior clearance on this domain
+                cached_clearance = CLEARANCE_CACHE.get(url, proxy_url)
+                if cached_clearance and cached_clearance.cdp_cookies:
+                    try:
+                        await cdp.call(
+                            "Network.setCookies",
+                            {"cookies": list(cached_clearance.cdp_cookies)},
+                        )
+                    except Exception:
+                        pass
 
                 if custom_cookie:
                     parsed_target = urlparse(url)
@@ -782,17 +845,26 @@ async def _run_single_browser_attempt(
                 except asyncio.TimeoutError:
                     pass
 
-                await asyncio.sleep(0.9)
+                # Give non-interactive Turnstile challenges 2.2s to auto-complete before touching DOM
+                if cdp.doc_status in (403, 429, 503):
+                    for _ in range(4):
+                        await asyncio.sleep(0.55)
+                        if cdp.doc_status < 400:
+                            await asyncio.sleep(0.6)
+                            break
+                else:
+                    await asyncio.sleep(0.8)
+
                 html = await cdp.get_outer_html()
 
                 nudged = False
-                wait_deadline = time.monotonic() + min(20.0, max(10.0, timeout_sec - 3.0))
+                wait_deadline = time.monotonic() + min(22.0, max(12.0, timeout_sec - 2.0))
                 poll_idx = 0
                 while time.monotonic() < wait_deadline and (
                     cdp.doc_status in (403, 429, 503) or _looks_like_js_challenge(html)
                 ):
                     poll_idx += 1
-                    if poll_idx in (2, 5, 9) or not nudged:
+                    if poll_idx in (1, 4, 8, 13) or not nudged:
                         nudged = True
                         await _nudge_turnstile_if_present(cdp)
                     await asyncio.sleep(1.0)
@@ -816,14 +888,15 @@ async def _run_single_browser_attempt(
                     cookies_res = await cdp.call("Network.getAllCookies")
                     cookies_list = cookies_res.get("cookies") or []
                     target_base = DomainClearanceCache._base_domain(cdp.doc_url or url)
-                    relevant_pairs = [
-                        f"{c['name']}={c['value']}"
+                    relevant_cookies = [
+                        c
                         for c in cookies_list
                         if isinstance(c, dict)
                         and c.get("name")
                         and target_base
                         and target_base in str(c.get("domain") or "").lower().lstrip(".")
                     ]
+                    relevant_pairs = [f"{c['name']}={c['value']}" for c in relevant_cookies]
                     if relevant_pairs:
                         CLEARANCE_CACHE.put(
                             cdp.doc_url or url,
@@ -831,9 +904,9 @@ async def _run_single_browser_attempt(
                             cookie_header="; ".join(relevant_pairs),
                             user_agent=clean_ua,
                             via_browser=True,
+                            cdp_cookies=relevant_cookies,
                         )
 
-                # Ask Chromium to flush cookies cleanly to persistent profile before exit
                 try:
                     await cdp.call("Browser.close", {}, timeout=1.5)
                 except Exception:
@@ -856,11 +929,22 @@ async def _run_single_browser_attempt(
             try:
                 proc.wait(timeout=1.5)
             except Exception:
+                if os.name == "nt":
+                    try:
+                        subprocess.run(
+                            ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            timeout=4,
+                        )
+                    except Exception:
+                        pass
                 try:
                     proc.kill()
                     proc.wait(timeout=3)
                 except Exception:
                     pass
+        shutil.rmtree(profile_dir, ignore_errors=True)
 
 
 async def fetch_via_local_browser(

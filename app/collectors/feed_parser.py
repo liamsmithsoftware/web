@@ -185,7 +185,40 @@ def discover_feed_urls_in_html(
             seen.add(full_url)
             candidates.append(full_url)
 
+    # Fallback for US DoD / AFPIMS (.gov / .mil) portals that link to `DesktopModules/ArticleCS/RSS.ashx`
+    if not candidates:
+        for a_tag in soup.find_all("a", href=True):
+            href = str(a_tag.get("href") or "").strip()
+            if "rss.ashx" not in href.lower():
+                continue
+            full_url = urljoin(page_url, href)
+            parsed_feed = urlparse(full_url)
+            if parsed_feed.scheme in ("http", "https") and full_url not in seen:
+                seen.add(full_url)
+                candidates.append(full_url)
+
     return candidates
+
+
+def is_placeholder_post(post: FetchedPost) -> bool:
+    """
+    Detects unedited CMS installation placeholder posts (e.g. WordPress default 'Hello world!'
+    on sites like `mei.edu` that store real articles in Custom Post Types).
+    """
+    url_path = (urlparse(post.post_url or "").path or "").rstrip("/").lower()
+    title_low = (post.title or "").strip().lower()
+    body_low = (post.content or "").lower()
+    if url_path.endswith("/hello-world") and (
+        title_low in ("hello world!", "hello world", "سلام دنیا!")
+        or "welcome to wordpress" in body_low
+        or "this is your first post" in body_low
+    ):
+        return True
+    if title_low in ("hello world!", "سلام دنیا!") and (
+        "welcome to wordpress" in body_low or "this is your first post" in body_low
+    ):
+        return True
+    return False
 
 
 def _parse_json_feed(

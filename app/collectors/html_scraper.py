@@ -27,6 +27,7 @@ SKIP_PATH_PATTERNS = re.compile(
     r"solutions|products|featured-insights|market-data|quotes|"
     r"search|wp-login\.php|wp-admin|wp-json|xmlrpc\.php|feed|rss|atom|sitemap|"
     r"tag|tags|tags-[a-z]{2}|issue|issues|topic|topics|vertical|verticals|category|categories|"
+    r"person|people|fellow|fellows|regions|programs|centers|initiatives|spotlights|biographies|newsagencyshow|"
     r"team|staff|experts|author|authors|contributor|contributors|users|webusers|comment|comments|reply"
     r")(?:/|$|\?)",
     re.IGNORECASE,
@@ -67,6 +68,18 @@ SECTION_HUB_SLUGS = {
     "onetwenty",
     "galleries",
     "books",
+    "research-commentary",
+    "arts-culture",
+    "mej",
+    "news-stories",
+    "feature-stories",
+    "speeches",
+    "from-the-services",
+    "photo-collections",
+    "multimedia",
+    "rocket-alerts",
+    "israel-in-the-world",
+    "join-the-fight",
 }
 
 EXCLUDED_SUBDOMAIN_PREFIXES = (
@@ -89,9 +102,10 @@ EXCLUDED_SUBDOMAIN_PREFIXES = (
 
 NAV_ANCHOR_TEXT_RE = re.compile(
     r"^(?:view\s+all|see\s+all|read\s+all|browse\s+all|show\s+all|explore\s+all|"
-    r"all\s+articles|all\s+posts|all\s+news|all\s+reports|more\s+news|load\s+more|"
-    r"read\s+more|learn\s+more|free\s+download|download\s+pdf|other\s+books|skip\s+to|"
-    r"مشاهده\s+همه|همه\s+اخبار|همه\s+مطالب|بیشتر\s+بخوانید|ادامه\s+مطلب)\b",
+    r"all\s+articles|all\s+posts|all\s+news|all\s+reports|all\s+videos|more\s+news|load\s+more|"
+    r"read\s+more|learn\s+more|see\s+more|view\s+collection|recent\s+alerts|donate\s+now|"
+    r"free\s+download|download\s+pdf|other\s+books|skip\s+to|"
+    r"مشاهده\s+همه|همه\s+اخبار|همه\s+مطالب|بیشتر\s+بخوانید|ادامه\s+مطلب|آرشیو|بایگانی)\b",
     re.IGNORECASE,
 )
 
@@ -113,7 +127,8 @@ STATIC_ASSET_EXT_RE = re.compile(
 
 ARTICLE_HINT_URL_RE = re.compile(
     r"(?:/\d{4}/\d{1,2}/|/\d{4,}|"
-    r"/(?:news|post|posts|article|articles|blog|story|content|fa/news|detail|view|"
+    r"/(?:news|post|posts|article|articles|blog|story|content|fa/news|detail|view|subjectview|"
+    r"news-stories|feature-stories|speeches|"
     r"online-analysis|strategic-comments|military-balance|"
     r"trackers|tracker|analyst-reports|analyst-report|company-news|webinars|resources|"
     r"analysis|podcasts|podcast|in_the_news|research|reports|report|insights|insight|"
@@ -477,6 +492,37 @@ def _extract_jsonld_items(
     return posts
 
 
+MEDIA_URL_COMPACT_TS_RE = re.compile(
+    r"(?:^|/|_|cr_)(20\d{2})(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])"
+    r"([01]\d|2[0-3])([0-5]\d)([0-5]\d)\d{2,}"
+)
+MEDIA_URL_DATED_PATH_RE = re.compile(
+    r"/(20\d{2})/([A-Za-z]{3,9}|\d{2})/(0[1-9]|[12]\d|3[01])/",
+    re.IGNORECASE,
+)
+
+
+def _extract_datetime_from_media_url(img_url: Optional[str], tz_name: str) -> Optional[datetime]:
+    """
+    Extracts exact upload day/time from per-article news photo URLs such as
+    `.../newspics/2026110916111798475416238.jpg` (ipis.ir) or `.../2026/Nov/10/...` (defense.gov),
+    intentionally ignoring generic `/YYYY/MM/` CMS folders.
+    """
+    if not img_url:
+        return None
+    m_ts = MEDIA_URL_COMPACT_TS_RE.search(img_url)
+    if m_ts:
+        yyyy, mm, dd, hh, mi, ss = m_ts.groups()
+        return parse_any_datetime(f"{yyyy}-{mm}-{dd}T{hh}:{mi}:{ss}", tz_name=tz_name)
+    m_path = MEDIA_URL_DATED_PATH_RE.search(img_url)
+    if m_path:
+        yyyy, mon, dd = m_path.groups()
+        if mon.isdigit():
+            return parse_any_datetime(f"{yyyy}-{mon}-{dd}", tz_name=tz_name)
+        return parse_any_datetime(f"{mon} {dd}, {yyyy}", tz_name=tz_name)
+    return None
+
+
 def _enrich_existing_post(
     existing: FetchedPost,
     *,
@@ -629,6 +675,8 @@ def extract_listing_posts(
 
         pub_dt = _extract_best_card_datetime(chosen_a, card, full_anchor_text, tz_name=tz_name)
         img_url = _extract_img_url(card, norm_url)
+        if pub_dt is None and img_url:
+            pub_dt = _extract_datetime_from_media_url(img_url, tz_name=tz_name)
 
         if guid in posts_by_guid:
             _enrich_existing_post(
@@ -695,6 +743,15 @@ def extract_listing_posts(
 
             pub_dt = _extract_best_card_datetime(a_tag, parent_box, full_anchor_text, tz_name=tz_name)
             img_url = _extract_img_url(parent_box if single_box else a_tag, norm_url)
+            if not img_url and parent_box is not a_tag:
+                raw_href = str(a_tag.get("href") or "")
+                for twin_a in parent_box.find_all("a", href=raw_href):
+                    if twin_a is not a_tag:
+                        img_url = _extract_img_url(twin_a, norm_url)
+                        if img_url:
+                            break
+            if pub_dt is None and img_url:
+                pub_dt = _extract_datetime_from_media_url(img_url, tz_name=tz_name)
 
             if guid in posts_by_guid:
                 _enrich_existing_post(
