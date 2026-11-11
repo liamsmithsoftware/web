@@ -89,6 +89,29 @@ ENGLISH_DMY_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Relative English timestamps ("1 minute ago", "18 hours ago", "2 days ago", "an hour ago", "about 2 months ago")
+ENGLISH_RELATIVE_RE = re.compile(
+    r"(?:\b|(?<=20\d{2}))(?:(?:about|around|approx\.?)\s+)?(?:(an?)|(\d{1,3}))\s+"
+    r"(seconds?|secs?|minutes?|mins?|hours?|hrs?|days?|weeks?|wks?|months?|mos?|years?|yrs?)\s+ago\b",
+    re.IGNORECASE,
+)
+
+# Relative Persian timestamps ("۳ ساعت پیش", "۲ روز قبل", "یک هفته پیش")
+PERSIAN_RELATIVE_RE = re.compile(
+    r"(?:(?<!\d)(\d{1,3})|\b(یک))\s*(ثانیه|دقیقه|ساعت|روز|هفته|ماه|سال)\s*(?:پیش|قبل)"
+)
+
+JUST_NOW_RE = re.compile(
+    r"(?:\bjust\s+now\b|\bmoments?\s+ago\b|همین\s+الان|لحظاتی\s+پیش|چند\s+لحظه\s+پیش)",
+    re.IGNORECASE,
+)
+
+TODAY_YESTERDAY_RE = re.compile(
+    r"(?:\b(today|yesterday)\b|(امروز|دیروز))"
+    r"(?:[\s،,\-–—|atساعت]*(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(am|pm)?)?",
+    re.IGNORECASE,
+)
+
 
 @dataclass(frozen=True)
 class SplitDateTime:
@@ -380,5 +403,78 @@ def parse_any_datetime(
             )
             if built is not None:
                 return built
+
+    # 9. Relative timestamps ("18 hours ago", "2 days ago", "۳ ساعت پیش", "yesterday", "دیروز")
+    now_utc = utc_now()
+    is_short_label = len(text) <= 72
+
+    if is_short_label and JUST_NOW_RE.search(text):
+        return now_utc
+
+    m_rel_en = ENGLISH_RELATIVE_RE.search(text)
+    if m_rel_en:
+        qty = 1 if m_rel_en.group(1) else int(m_rel_en.group(2) or 0)
+        unit = m_rel_en.group(3).lower()
+        if qty > 0:
+            if unit.startswith("sec"):
+                return now_utc - timedelta(seconds=qty)
+            if unit.startswith("min"):
+                return now_utc - timedelta(minutes=qty)
+            if unit.startswith(("hour", "hr")):
+                return now_utc - timedelta(hours=qty)
+            if unit.startswith("day") and (is_short_label or qty <= 60):
+                return now_utc - timedelta(days=qty)
+            if unit.startswith(("week", "wk")) and (is_short_label or qty <= 12):
+                return now_utc - timedelta(weeks=qty)
+            if is_short_label and unit.startswith(("month", "mo")):
+                return now_utc - timedelta(days=qty * 30)
+            if is_short_label and unit.startswith(("year", "yr")):
+                return now_utc - timedelta(days=qty * 365)
+
+    m_rel_fa = PERSIAN_RELATIVE_RE.search(text)
+    if m_rel_fa:
+        qty_fa = 1 if m_rel_fa.group(2) else int(m_rel_fa.group(1) or 0)
+        unit_fa = m_rel_fa.group(3)
+        if qty_fa > 0:
+            if unit_fa == "ثانیه":
+                return now_utc - timedelta(seconds=qty_fa)
+            if unit_fa == "دقیقه":
+                return now_utc - timedelta(minutes=qty_fa)
+            if unit_fa == "ساعت":
+                return now_utc - timedelta(hours=qty_fa)
+            if unit_fa == "روز" and (is_short_label or qty_fa <= 60):
+                return now_utc - timedelta(days=qty_fa)
+            if unit_fa == "هفته" and (is_short_label or qty_fa <= 12):
+                return now_utc - timedelta(weeks=qty_fa)
+            if is_short_label and unit_fa == "ماه":
+                return now_utc - timedelta(days=qty_fa * 30)
+            if is_short_label and unit_fa == "سال":
+                return now_utc - timedelta(days=qty_fa * 365)
+
+    if is_short_label:
+        m_ty = TODAY_YESTERDAY_RE.search(text)
+        if m_ty:
+            word = (m_ty.group(1) or m_ty.group(2) or "").lower()
+            day_offset = 1 if word in ("yesterday", "دیروز") else 0
+            local_now = now_utc.astimezone(local_tz)
+            base_day = (local_now - timedelta(days=day_offset)).date()
+            if m_ty.group(3) is not None:
+                hh = int(m_ty.group(3))
+                mm = int(m_ty.group(4) or 0)
+                ss = int(m_ty.group(5) or 0)
+                ap = (m_ty.group(6) or "").lower()
+                if ap == "pm" and hh < 12:
+                    hh += 12
+                elif ap == "am" and hh == 12:
+                    hh = 0
+                try:
+                    return datetime(
+                        base_day.year, base_day.month, base_day.day, hh, mm, ss, tzinfo=local_tz
+                    ).astimezone(timezone.utc)
+                except ValueError:
+                    pass
+            return datetime(
+                base_day.year, base_day.month, base_day.day, 0, 0, 0, tzinfo=local_tz
+            ).astimezone(timezone.utc)
 
     return None

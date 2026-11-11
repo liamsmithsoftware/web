@@ -13,7 +13,11 @@ from app.collectors.base import (
     build_httpx_proxy_url,
     build_request_headers,
 )
-from app.collectors.browser_fetcher import CLEARANCE_CACHE, fetch_via_local_browser
+from app.collectors.browser_fetcher import (
+    CLEARANCE_CACHE,
+    _looks_like_js_challenge,
+    fetch_via_local_browser,
+)
 from app.config import DEFAULT_REQUEST_TIMEOUT
 
 try:
@@ -176,11 +180,14 @@ def is_waf_challenge(status_code: int, text: str, headers: Dict[str, str]) -> bo
         return True
     if headers.get("cf-mitigated", "").lower() == "challenge":
         return True
-    head = (text or "")[:4096].lower()
-    if "<title>just a moment..." in head or "attention required! | cloudflare" in head:
-        return True
-    if status_code >= 400 and any(marker in head for marker in WAF_BODY_MARKERS):
-        return True
+    if text and text.strip():
+        head = text[:4096].lower()
+        if "<title>just a moment..." in head or "attention required! | cloudflare" in head:
+            return True
+        if status_code >= 400 and any(marker in head for marker in WAF_BODY_MARKERS):
+            return True
+        if len(text) < 48_000 and _looks_like_js_challenge(text):
+            return True
     return False
 
 
@@ -353,10 +360,12 @@ class SmartHttpFetcher:
                 pass
 
         # Layer 4: Real Local Browser CDP (Edge / Chrome) for Cloudflare JS Managed Challenges!
+        # On secondary direct failover (`fast_timeout` set), run browser ONLY if direct TCP/TLS actually
+        # reached the server (`best_resp is not None`), so filtered sites don't waste time launching a browser.
         if (
             self.allow_browser_fallback
             and not _is_loopback_target(url)
-            and fast_timeout is None
+            and (fast_timeout is None or best_resp is not None)
             and (
                 best_resp is None
                 or is_waf_challenge(best_resp.status_code, best_resp.text, best_resp.headers)
