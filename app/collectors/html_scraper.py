@@ -4,7 +4,7 @@ import copy
 import html as html_lib
 import json
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urljoin, urlparse
 
@@ -24,10 +24,10 @@ SKIP_PATH_PATTERNS = re.compile(
     r"login|signin|sign-in|signup|sign-up|register|logout|account|profile|cart|checkout|"
     r"contact|contact-us|about|about-us|privacy|privacy-policy|terms|faq|ads|advertise|"
     r"donate|subscribe|newsletter|careers|jobs|press-kit|capabilities|sectors|services|partners|"
-    r"solutions|products|featured-insights|"
+    r"solutions|products|featured-insights|market-data|quotes|"
     r"search|wp-login\.php|wp-admin|wp-json|xmlrpc\.php|feed|rss|atom|sitemap|"
-    r"tag|tags|issue|issues|topic|topics|vertical|verticals|category|categories|team|staff|experts|"
-    r"author|authors|contributor|contributors|users|webusers|comment|comments|reply"
+    r"tag|tags|tags-[a-z]{2}|issue|issues|topic|topics|vertical|verticals|category|categories|"
+    r"team|staff|experts|author|authors|contributor|contributors|users|webusers|comment|comments|reply"
     r")(?:/|$|\?)",
     re.IGNORECASE,
 )
@@ -60,6 +60,13 @@ SECTION_HUB_SLUGS = {
     "highlights",
     "archive",
     "archives",
+    "op-eds",
+    "policy",
+    "community",
+    "atid",
+    "onetwenty",
+    "galleries",
+    "books",
 }
 
 EXCLUDED_SUBDOMAIN_PREFIXES = (
@@ -83,7 +90,14 @@ EXCLUDED_SUBDOMAIN_PREFIXES = (
 NAV_ANCHOR_TEXT_RE = re.compile(
     r"^(?:view\s+all|see\s+all|read\s+all|browse\s+all|show\s+all|explore\s+all|"
     r"all\s+articles|all\s+posts|all\s+news|all\s+reports|more\s+news|load\s+more|"
-    r"read\s+more|learn\s+more|مشاهده\s+همه|همه\s+اخبار|همه\s+مطالب|بیشتر\s+بخوانید|ادامه\s+مطلب)\b",
+    r"read\s+more|learn\s+more|free\s+download|download\s+pdf|other\s+books|skip\s+to|"
+    r"مشاهده\s+همه|همه\s+اخبار|همه\s+مطالب|بیشتر\s+بخوانید|ادامه\s+مطلب)\b",
+    re.IGNORECASE,
+)
+
+GENERIC_LINK_ATTR_RE = re.compile(
+    r"^(?:go\s+to\s+page|read\s+more|learn\s+more|permalink|link|share\s+on|powered\s+by|"
+    r"default\s+image|image|photo|thumbnail|logo|banner|icon|avatar)$",
     re.IGNORECASE,
 )
 
@@ -93,7 +107,7 @@ LEADING_BADGE_RE = re.compile(
 )
 
 STATIC_ASSET_EXT_RE = re.compile(
-    r"\.(?:jpg|jpeg|png|gif|webp|svg|ico|css|js|mjs|woff|woff2|ttf|eot|mp4|mp3|zip|rar|exe|apk)$",
+    r"\.(?:jpg|jpeg|png|gif|webp|svg|ico|css|js|mjs|woff|woff2|ttf|eot|mp4|mp3|pdf|zip|rar|exe|apk)$",
     re.IGNORECASE,
 )
 
@@ -112,7 +126,8 @@ NOISE_CONTAINER_SELECTOR = (
     "script, style, noscript, iframe, svg, form, nav, footer, "
     ".navbar, .menu, .main-menu, .site-footer, .breadcrumb, .breadcrumbs, "
     ".pagination, .pager, .comments, #comments, .share, .social-share, "
-    ".related-posts, .related-news, .advertisement, .ads"
+    ".related-posts, .related-news, .advertisement, .ads, "
+    ".slick-cloned, .owl-cloned"
 )
 
 ARTICLE_BODY_SELECTORS = (
@@ -254,13 +269,28 @@ def _clean_headline_text(raw_title: str) -> str:
     return cleaned
 
 
+def _is_usable_attr_headline(val: str) -> bool:
+    txt = re.sub(r"\s+", " ", (val or "")).strip()
+    if len(txt) < 8 or len(txt) > 200:
+        return False
+    if GENERIC_LINK_ATTR_RE.search(txt) or NAV_ANCHOR_TEXT_RE.search(txt):
+        return False
+    if re.fullmatch(r"[\w\-]+\.(?:jpg|jpeg|png|webp|svg|gif)", txt, re.IGNORECASE):
+        return False
+    if re.match(r"^image\d+", txt, re.IGNORECASE):
+        return False
+    return True
+
+
 def _extract_clean_title_from_anchor(
     a_tag: Tag,
     fallback_container: Optional[Tag] = None,
+    norm_url: str = "",
 ) -> Tuple[str, bool, str]:
     """
     Returns (clean_title, is_emphasized_heading, full_anchor_text).
-    Handles cards where <a> wraps badge + <h3>/<strong> + summary + date.
+    Handles cards where <a> wraps badge + <h3>/<strong> + summary + date, AND image-linked
+    article cards where the headline sits in `a[title]` or `img[alt]` (e.g. en.idi.org.il).
     """
     full_anchor_text = re.sub(r"\s+", " ", a_tag.get_text(" ", strip=True)).strip()
 
@@ -282,7 +312,24 @@ def _extract_clean_title_from_anchor(
             return title, True, full_anchor_text
 
     in_parent_heading = a_tag.find_parent(["h1", "h2", "h3", "h4", "h5", "h6"]) is not None
-    return _clean_headline_text(full_anchor_text), in_parent_heading, full_anchor_text
+    cleaned_visible = _clean_headline_text(full_anchor_text)
+    if len(cleaned_visible) >= 6:
+        return cleaned_visible, in_parent_heading, full_anchor_text
+
+    # Fallback for image-only article cards (e.g. en.idi.org.il/articles/67075)
+    for attr_name in ("title", "aria-label"):
+        raw_attr = str(a_tag.get(attr_name) or "").strip()
+        if _is_usable_attr_headline(raw_attr):
+            return _clean_headline_text(raw_attr), False, full_anchor_text
+
+    if norm_url and ARTICLE_HINT_URL_RE.search(norm_url):
+        img = a_tag.find("img")
+        if img:
+            raw_alt = str(img.get("alt") or "").strip()
+            if _is_usable_attr_headline(raw_alt):
+                return _clean_headline_text(raw_alt), True, full_anchor_text
+
+    return cleaned_visible, in_parent_heading, full_anchor_text
 
 
 def _extract_best_card_datetime(
@@ -430,6 +477,68 @@ def _extract_jsonld_items(
     return posts
 
 
+def _enrich_existing_post(
+    existing: FetchedPost,
+    *,
+    new_title: str,
+    new_content: str,
+    new_pub_dt: Optional[datetime],
+    new_img_url: Optional[str],
+) -> None:
+    """Upgrades an earlier ticker/image-only occurrence with full title, date, or thumbnail."""
+    if new_title and len(new_title) > len(existing.title) and (
+        existing.title.endswith(("...", "…")) or len(existing.title) < 14
+    ):
+        existing.title = new_title[:240]
+        if len(new_content) >= len(existing.content):
+            existing.content = new_content
+    elif new_content and len(new_content) > len(existing.content) + 30:
+        existing.content = new_content
+
+    if existing.published_at is None and new_pub_dt is not None:
+        existing.published_at = new_pub_dt
+
+    if existing.media_url is None and new_img_url:
+        existing.media_url = new_img_url
+        existing.media_type = "photo"
+
+
+def _sort_posts_if_out_of_order(posts: List[FetchedPost]) -> List[FetchedPost]:
+    """
+    Preserves natural DOM order unless explicit timestamps show the page rendered older
+    carousel/featured items ahead of newer items by >= 2 days (e.g. memri.org).
+    """
+    dated_indices = [(idx, p.published_at) for idx, p in enumerate(posts) if p.published_at is not None]
+    if len(dated_indices) < 2:
+        return posts
+
+    has_inversion = False
+    min_seen_dt = dated_indices[0][1]
+    for _, dt in dated_indices[1:]:
+        if dt - min_seen_dt >= timedelta(days=2):
+            has_inversion = True
+            break
+        if dt < min_seen_dt:
+            min_seen_dt = dt
+
+    if not has_inversion:
+        return posts
+
+    dated_pairs = [
+        (idx, p) for idx, p in enumerate(posts) if p.published_at is not None
+    ]
+    undated_posts = [p for p in posts if p.published_at is None]
+
+    # Sort newest calendar date first; preserve original DOM order (`idx` ascending) for same-day items
+    dated_pairs.sort(
+        key=lambda pair: (
+            -int(pair[1].published_at.date().toordinal()),  # type: ignore[union-attr]
+            pair[0],
+        )
+    )
+    return [p for _, p in dated_pairs] + undated_posts
+
+
 def extract_listing_posts(
     html: str,
     page_url: str,
@@ -480,7 +589,7 @@ def extract_listing_posts(
                 card_containers.append(el)
 
     for card in card_containers:
-        # Prefer heading anchor inside card, otherwise longest meaningful anchor
+        # Prefer heading anchor inside card, otherwise longest meaningful anchor (including image-alt article links)
         heading_link = card.select_one("h1 a[href], h2 a[href], h3 a[href], h4 a[href], .title a[href], a.title[href]")
         chosen_a = heading_link
         if not chosen_a:
@@ -488,6 +597,8 @@ def extract_listing_posts(
                 a
                 for a in card.find_all("a", href=True)
                 if len(a.get_text(" ", strip=True)) >= 8
+                or a.get("title")
+                or (a.find("img") and a.find("img").get("alt"))
             ]
             chosen_a = max(anchors, key=lambda a: len(a.get_text(" ", strip=True)), default=None)
         if not chosen_a:
@@ -498,10 +609,12 @@ def extract_listing_posts(
             continue
 
         guid = compute_post_guid(norm_url, site_canonical_url=norm_page_url)
-        if not guid or guid in posts_by_guid:
+        if not guid:
             continue
 
-        title, _, full_anchor_text = _extract_clean_title_from_anchor(chosen_a, fallback_container=card)
+        title, _, full_anchor_text = _extract_clean_title_from_anchor(
+            chosen_a, fallback_container=card, norm_url=norm_url
+        )
         if len(title) < 4 or (len(title) <= 45 and NAV_ANCHOR_TEXT_RE.search(title)):
             continue
 
@@ -516,6 +629,16 @@ def extract_listing_posts(
 
         pub_dt = _extract_best_card_datetime(chosen_a, card, full_anchor_text, tz_name=tz_name)
         img_url = _extract_img_url(card, norm_url)
+
+        if guid in posts_by_guid:
+            _enrich_existing_post(
+                posts_by_guid[guid],
+                new_title=title,
+                new_content=content,
+                new_pub_dt=pub_dt,
+                new_img_url=img_url,
+            )
+            continue
 
         views_el = card.select_one('[class*="view"], [class*="visit"]')
         views = parse_views_text(views_el.get_text(" ", strip=True) if views_el else None)
@@ -542,10 +665,12 @@ def extract_listing_posts(
                 continue
 
             guid = compute_post_guid(norm_url, site_canonical_url=norm_page_url)
-            if not guid or guid in posts_by_guid:
+            if not guid:
                 continue
 
-            text, in_heading, full_anchor_text = _extract_clean_title_from_anchor(a_tag)
+            text, in_heading, full_anchor_text = _extract_clean_title_from_anchor(
+                a_tag, norm_url=norm_url
+            )
             if len(text) <= 45 and NAV_ANCHOR_TEXT_RE.search(text):
                 continue
 
@@ -571,6 +696,16 @@ def extract_listing_posts(
             pub_dt = _extract_best_card_datetime(a_tag, parent_box, full_anchor_text, tz_name=tz_name)
             img_url = _extract_img_url(parent_box if single_box else a_tag, norm_url)
 
+            if guid in posts_by_guid:
+                _enrich_existing_post(
+                    posts_by_guid[guid],
+                    new_title=text,
+                    new_content=card_content,
+                    new_pub_dt=pub_dt,
+                    new_img_url=img_url,
+                )
+                continue
+
             post = FetchedPost(
                 post_guid=guid,
                 post_url=norm_url,
@@ -591,7 +726,7 @@ def extract_listing_posts(
             "لطفاً آدرس صفحه اخبار/مقالات یا فید RSS وب‌سایت را وارد کنید."
         )
 
-    return site_title, result_posts
+    return site_title, _sort_posts_if_out_of_order(result_posts)
 
 
 def extract_article_details(
