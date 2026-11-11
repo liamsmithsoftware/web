@@ -16,6 +16,7 @@ from app.collectors.browser_fetcher import CLEARANCE_CACHE
 from app.collectors.feed_parser import (
     discover_feed_urls_in_html,
     is_feed_document,
+    is_placeholder_post,
     parse_feed_content,
 )
 from app.collectors.html_scraper import extract_article_details, extract_listing_posts
@@ -89,6 +90,17 @@ WSJ_SECTION_FEEDS: Dict[str, str] = {
     "opinion": "https://feeds.content.dowjones.io/public/rss/RSSOpinion",
 }
 
+WAR_GOV_SECTION_FEEDS: Dict[str, str] = {
+    "news-stories": "https://www.war.gov/DesktopModules/ArticleCS/RSS.ashx?max=20&ContentType=1&Site=945",
+    "releases": "https://www.war.gov/DesktopModules/ArticleCS/RSS.ashx?max=20&ContentType=9&Site=945",
+    "advisories": "https://www.war.gov/DesktopModules/ArticleCS/RSS.ashx?max=20&ContentType=2&Site=945",
+    "speeches": "https://www.war.gov/DesktopModules/ArticleCS/RSS.ashx?max=20&ContentType=11&Site=945",
+    "transcripts": "https://www.war.gov/DesktopModules/ArticleCS/RSS.ashx?max=20&ContentType=13&Site=945",
+    "features": "https://www.war.gov/DesktopModules/ArticleCS/RSS.ashx?max=20&ContentType=800&Site=945",
+    "feature-stories": "https://www.war.gov/DesktopModules/ArticleCS/RSS.ashx?max=20&ContentType=800&Site=945",
+    "contracts": "https://www.war.gov/DesktopModules/ArticleCS/RSS.ashx?max=20&ContentType=400&Site=945",
+}
+
 SPARSE_HOMEPAGE_HUB_PRIORITY = (
     "/articles",
     "/news",
@@ -102,8 +114,8 @@ SPARSE_HOMEPAGE_HUB_PRIORITY = (
 def _resolve_known_public_feeds(url: str) -> List[str]:
     """
     Returns known official external RSS feeds for sites that host feeds on a separate CDN
-    behind DataDome/paywalls (e.g. `wsj.com` -> `feeds.content.dowjones.io`) or vanity domains
-    (`ipforum.org` -> `israelpolicyforum.org/feed/`).
+    behind DataDome/paywalls (`wsj.com`), AFPIMS `RSS.ashx` portals (`war.gov` / `defense.gov`),
+    or vanity domains (`ipforum.org` -> `israelpolicyforum.org/feed/`).
     """
     parsed = urlparse(url or "")
     reg_domain = extract_registrable_domain(parsed.hostname or "")
@@ -114,11 +126,21 @@ def _resolve_known_public_feeds(url: str) -> List[str]:
             first_seg = path_parts[0]
             if first_seg in WSJ_SECTION_FEEDS:
                 return [WSJ_SECTION_FEEDS[first_seg]]
-        # Root or general landing page -> official WSJ World + US News feeds
         return [
             "https://feeds.content.dowjones.io/public/rss/RSSWorldNews",
             "https://feeds.content.dowjones.io/public/rss/RSSUSnews",
         ]
+
+    if reg_domain in ("war.gov", "defense.gov"):
+        host = "www.war.gov" if reg_domain == "war.gov" else "www.defense.gov"
+        for seg in reversed(path_parts):
+            if seg in WAR_GOV_SECTION_FEEDS:
+                return [WAR_GOV_SECTION_FEEDS[seg].replace("www.war.gov", host)]
+        if not path_parts or path_parts[0] == "news":
+            return [
+                f"https://{host}/DesktopModules/ArticleCS/RSS.ashx?max=20&ContentType=1&Site=945",
+                f"https://{host}/DesktopModules/ArticleCS/RSS.ashx?max=20&ContentType=9&Site=945",
+            ]
 
     if reg_domain == "ipforum.org" and not path_parts:
         return ["https://israelpolicyforum.org/feed/"]
@@ -327,6 +349,7 @@ class WebSiteCollector:
 
         if is_feed_document(resp.text, resp.content_type):
             title, posts = parse_feed_content(resp.text, base_url=effective_base, tz_name=tz_name)
+            posts = [p for p in posts if not is_placeholder_post(p)]
             if posts:
                 return FetchBatchResult(
                     site_title=title,
@@ -337,6 +360,7 @@ class WebSiteCollector:
 
         if is_wp_posts_json(resp.text, resp.content_type):
             title, posts = parse_wp_posts_json(resp.text, base_url=effective_base, tz_name=tz_name)
+            posts = [p for p in posts if not is_placeholder_post(p)]
             if posts:
                 return FetchBatchResult(
                     site_title=title,
@@ -468,10 +492,13 @@ class WebSiteCollector:
         endpoints: List[str] = []
         base_slash = preferred.rstrip("/") + "/"
         if is_root:
-            for suffix in COMMON_ROOT_FEED_PATHS:
-                endpoints.append(urljoin(base_slash, suffix.lstrip("/")))
+            endpoints.append(urljoin(base_slash, "feed/"))
             origin = _origin_of(preferred)
             endpoints.append(urljoin(origin, "wp-json/wp/v2/posts?per_page=20&_embed=1"))
+            for suffix in COMMON_ROOT_FEED_PATHS:
+                ep = urljoin(base_slash, suffix.lstrip("/"))
+                if ep not in endpoints:
+                    endpoints.append(ep)
         else:
             endpoints.append(urljoin(base_slash, "feed/"))
             endpoints.append(urljoin(base_slash, "rss"))
@@ -663,7 +690,7 @@ class WebSiteCollector:
             if (looks_like_feed_url(canonical_url) or "/wp-json/" in canonical_url) and not known_feed_url:
                 resp.raise_for_status()
 
-        # 1b. Known official external feeds (e.g. wsj.com -> feeds.content.dowjones.io, ipforum.org -> israelpolicyforum.org)
+        # 1b. Known official external feeds (wsj.com, war.gov, ipforum.org)
         public_feeds = _resolve_known_public_feeds(canonical_url)
         if public_feeds:
             fast_probe = SmartHttpFetcher(fetcher.settings, allow_browser_fallback=False)
@@ -672,6 +699,12 @@ class WebSiteCollector:
             )
             if pub_res is not None:
                 return pub_res
+            if fetcher.allow_browser_fallback:
+                pub_browser_res = await self._probe_candidate_endpoints(
+                    fetcher, public_feeds[:1], base_url=canonical_url, tz_name=tz_name
+                )
+                if pub_browser_res is not None:
+                    return pub_browser_res
 
         # 2. Fetch the main target URL (preferring https:// for plain http:// public URLs)
         resp = await self._get_with_https_upgrade(fetcher, canonical_url)
@@ -694,20 +727,7 @@ class WebSiteCollector:
             blind_eps = self._build_blind_fallback_endpoints(final_url, is_root=is_root)
             fast_probe_fetcher = SmartHttpFetcher(fetcher.settings, allow_browser_fallback=False)
 
-            # If root returned 403/503 without solving cf_clearance yet, let primary `/feed/` try browser once
-            if (
-                blind_eps
-                and resp.status_code in (401, 403, 406, 429, 503)
-                and fetcher.allow_browser_fallback
-                and CLEARANCE_CACHE.get(final_url, None) is None
-            ):
-                first_try = await self._probe_candidate_endpoints(
-                    fetcher, blind_eps[:1], base_url=final_url, tz_name=tz_name
-                )
-                if first_try is not None:
-                    return first_try
-                blind_eps = blind_eps[1:]
-
+            # First try fast non-browser probes across all blind endpoints (often `/wp-json/` or `/feed/` is unblocked!)
             rescued = await self._probe_candidate_endpoints(
                 fast_probe_fetcher,
                 blind_eps,
@@ -716,6 +736,18 @@ class WebSiteCollector:
             )
             if rescued is not None:
                 return rescued
+
+            # If still blocked, allow browser fallback on primary `/feed/` and `/wp-json/`
+            if (
+                blind_eps
+                and resp.status_code in (401, 403, 406, 429, 503)
+                and fetcher.allow_browser_fallback
+            ):
+                browser_rescued = await self._probe_candidate_endpoints(
+                    fetcher, blind_eps[:2], base_url=final_url, tz_name=tz_name
+                )
+                if browser_rescued is not None:
+                    return browser_rescued
 
             # Dead subpath rescue (e.g. https://www.navaltoday.com/news -> 404 -> rescue from root /feed/ or /)
             if not is_root and resp.status_code in (404, 410):
@@ -755,11 +787,13 @@ class WebSiteCollector:
         )
 
         # 5. Proactive WordPress / hidden-feed discovery (fdd.org, bicom.org.uk, rasmussenglobal.com)
-        if not discovered_feeds and is_wordpress_html(resp.text):
+        if is_wordpress_html(resp.text):
             base_slash = final_url.rstrip("/") + "/"
-            discovered_feeds.append(urljoin(base_slash, "feed/"))
+            feed_ep = urljoin(base_slash, "feed/")
+            if not discovered_feeds:
+                discovered_feeds.append(feed_ep)
             wp_api_url = discover_wp_posts_api_url(resp.text, final_url, is_root=is_root)
-            if wp_api_url:
+            if wp_api_url and wp_api_url not in discovered_feeds:
                 discovered_feeds.append(wp_api_url)
 
         if discovered_feeds:
