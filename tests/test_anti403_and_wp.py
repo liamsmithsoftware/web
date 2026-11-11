@@ -9,14 +9,21 @@ from pathlib import Path
 import pytest
 
 from app.collectors.base import CollectorError
-from app.collectors.browser_fetcher import CLEARANCE_CACHE
+from app.collectors.browser_fetcher import (
+    CLEARANCE_CACHE,
+    _GUI_REQUIRED_DOMAINS,
+    _build_ua_override_params,
+    _looks_like_js_challenge,
+    fetch_via_local_browser,
+)
 from app.collectors.html_scraper import extract_listing_posts
 from app.collectors.http_fetcher import HttpFetchResponse, SmartHttpFetcher, resolve_proxy_candidates
 from app.collectors.sitemap_parser import extract_child_sitemaps, parse_sitemap_posts
-from app.collectors.web_collector import WebSiteCollector, _https_upgrade_candidate
+from app.collectors.web_collector import WebSiteCollector, _https_upgrade_candidate, _is_sso_login_wall
 from app.collectors.wp_api_parser import parse_wp_posts_json
 from app.database import DEFAULT_SETTINGS
-from app.utils.jalali import parse_any_datetime
+from app.utils.jalali import parse_any_datetime, utc_now
+from app.utils.site_parser import extract_registrable_domain
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -359,3 +366,241 @@ async def test_dead_system_proxy_falls_back_gracefully_to_direct(monkeypatch, wa
     fetcher = SmartHttpFetcher(dict(DEFAULT_SETTINGS))
     resp = await fetcher.get(f"{waf_server}/fdd-like/")
     assert resp.status_code == 200
+
+
+LAWFARE_AND_CRITICAL_THREATS_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head><title>Lawfare | Lawfare</title></head>
+<body>
+    <a href="https://www.lawfaremedia.org/article/highlights">View All Highlights</a>
+    <a href="https://www.lawfaremedia.org/contributors/jhealey">Jason Healey</a>
+    <ul>
+        <li>
+            <img src="https://lawfare-assets-new.azureedge.net/featured/7457.jpeg" />
+            <h3>
+                <a href="/article/ai-can-(mostly)-solve-cyber-regulatory-harmonization-and-efficiency">
+                    AI Can (Mostly) Solve Cyber Regulatory Harmonization and Efficiency
+                </a>
+            </h3>
+            <a href="/contributors/jhealey">Jason Healey</a>
+            <span>Nov 10, 2026</span>
+            <p>With AI-driven compliance, it has never been less important to fix cyber-regulatory inefficiencies.</p>
+        </li>
+    </ul>
+</body>
+</html>
+"""
+
+CRITICAL_THREATS_LIKE_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head><title>Critical Threats</title></head>
+<body>
+    <a href="/webusers/password/new">Forgot Password?</a>
+    <article>
+        <a href="/analysis/iran-update-november-8-2026">
+            article
+            <strong>Iran Update, November 8, 2026</strong>
+            <span>2 days ago</span>
+        </a>
+    </article>
+    <article>
+        <a href="/analysis/al-shabaab-somalia-africa-file">
+            article
+            <strong>Al Shabaab Ambush in South West State: Africa File</strong>
+            <span>3 days ago</span>
+        </a>
+    </article>
+</body>
+</html>
+"""
+
+MORNING_CONSULT_MC_CONTENT_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head><title>Morning Consult Intelligence</title></head>
+<body>
+    <a href="https://intel.morningconsult.com/mc-content/verticals/economics">Economics</a>
+    <a href="https://morningconsult.com/reports">Explore</a>
+    <a href="https://accounts.morningconsult.com/oauth2/authorize">Sign in</a>
+    <div class="card">
+        <a href="https://pro.morningconsult.com/trackers/consumer-spending-tracker">
+            <strong>U.S. Consumer Spending Tracker</strong>
+        </a>
+        <span>November 10, 2026</span>
+    </div>
+    <div class="card">
+        <a href="https://pro.morningconsult.com/analyst-reports/political-scrutiny-after-2026-midterms">
+            <strong>Big business primed to face the heat after 2026 midterms</strong>
+        </a>
+        <span>November 8, 2026</span>
+    </div>
+</body>
+</html>
+"""
+
+
+def test_relative_english_and_persian_dates():
+    now = utc_now()
+
+    dt_18h = parse_any_datetime("18 hours ago", tz_name="UTC")
+    assert dt_18h is not None
+    assert 17.9 * 3600 <= (now - dt_18h).total_seconds() <= 18.1 * 3600
+
+    dt_2d = parse_any_datetime("2 days ago", tz_name="UTC")
+    assert dt_2d is not None
+    assert 47.9 * 3600 <= (now - dt_2d).total_seconds() <= 48.1 * 3600
+
+    dt_fa = parse_any_datetime("۳ ساعت پیش", tz_name="Asia/Tehran")
+    assert dt_fa is not None
+    assert 2.9 * 3600 <= (now - dt_fa).total_seconds() <= 3.1 * 3600
+
+    dt_yest = parse_any_datetime("Yesterday at 2:30 PM", tz_name="UTC")
+    assert dt_yest is not None
+    assert dt_yest.hour == 14 and dt_yest.minute == 30
+
+
+def test_lawfare_critical_threats_and_morning_consult_html_extraction():
+    # 1. Lawfare: parentheses in slug, skips /contributors/ and 'View All Highlights', extracts summary & date
+    lf_title, lf_posts = extract_listing_posts(
+        LAWFARE_AND_CRITICAL_THREATS_HTML, page_url="https://www.lawfaremedia.org/", tz_name="UTC"
+    )
+    assert lf_title == "Lawfare"
+    assert len(lf_posts) == 1
+    assert lf_posts[0].post_url == (
+        "https://www.lawfaremedia.org/article/ai-can-(mostly)-solve-cyber-regulatory-harmonization-and-efficiency"
+    )
+    assert "With AI-driven compliance" in lf_posts[0].content
+    assert lf_posts[0].published_at == datetime(2026, 11, 10, 0, 0, tzinfo=timezone.utc)
+
+    # 2. Critical Threats: strips 'article' badge inside <article><a><strong>, parses explicit & relative dates
+    ct_title, ct_posts = extract_listing_posts(
+        CRITICAL_THREATS_LIKE_HTML, page_url="https://www.criticalthreats.org/", tz_name="UTC"
+    )
+    assert ct_title == "Critical Threats"
+    assert len(ct_posts) == 2
+    assert ct_posts[0].title == "Iran Update, November 8, 2026"
+    assert ct_posts[0].published_at == datetime(2026, 11, 8, 0, 0, tzinfo=timezone.utc)
+    assert ct_posts[1].title == "Al Shabaab Ambush in South West State: Africa File"
+    assert ct_posts[1].published_at is not None
+
+    # 3. Morning Consult: matches sibling subdomains pro.morningconsult.com <-> intel.morningconsult.com,
+    #    skips /verticals/ and accounts.morningconsult.com
+    mc_title, mc_posts = extract_listing_posts(
+        MORNING_CONSULT_MC_CONTENT_HTML,
+        page_url="https://intel.morningconsult.com/mc-content",
+        tz_name="UTC",
+    )
+    assert len(mc_posts) == 2
+    assert mc_posts[0].post_url == "https://pro.morningconsult.com/trackers/consumer-spending-tracker"
+    assert mc_posts[0].published_at == datetime(2026, 11, 10, 0, 0, tzinfo=timezone.utc)
+    assert mc_posts[1].post_url == (
+        "https://pro.morningconsult.com/analyst-reports/political-scrutiny-after-2026-midterms"
+    )
+
+
+def test_client_hints_metadata_turnstile_detection_and_registrable_domain():
+    # Registrable domain handles .org.uk and domains starting with 'w'
+    assert extract_registrable_domain("http://www.bicom.org.uk/news") == "bicom.org.uk"
+    assert extract_registrable_domain("https://worldnews.com/feed") == "worldnews.com"
+    assert extract_registrable_domain("https://intel.morningconsult.com/") == "morningconsult.com"
+
+    # Client Hints userAgentMetadata removes HeadlessChrome and sets Edge/Chrome brands cleanly
+    ua_edge = _build_ua_override_params(
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) HeadlessChrome/131.0.6778.86 Safari/537.36 Edg/131.0.2903.70",
+        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+    )
+    assert "HeadlessChrome" not in ua_edge["userAgent"]
+    brand_names = [b["brand"] for b in ua_edge["userAgentMetadata"]["brands"]]
+    assert "Microsoft Edge" in brand_names
+    assert "HeadlessChrome" not in brand_names
+
+    # Modern Turnstile challenge where <title> is the domain name
+    turnstile_dom = (
+        "<html><head><title>rasmussenglobal.com</title></head>"
+        "<body><div id=\"turnstile-wrapper\"></div><script>window._cf_chl_opt={};</script></body></html>"
+    )
+    assert _looks_like_js_challenge(turnstile_dom) is True
+    assert _looks_like_js_challenge(LAWFARE_AND_CRITICAL_THREATS_HTML) is False
+
+
+async def test_two_pass_gui_browser_fallback_when_headless_loops_on_turnstile(monkeypatch):
+    _GUI_REQUIRED_DOMAINS.clear()
+    calls = []
+
+    async def _fake_attempt(browser_bin, url, *, headless, **kwargs):
+        calls.append(headless)
+        if headless:
+            return {
+                "url": url,
+                "status_code": 403,
+                "text": "<html><title>Just a moment...</title><script>window._cf_chl_opt={};</script></html>",
+                "headers": {"content-type": "text/html"},
+                "via": "browser_cdp",
+                "solved": False,
+            }
+        return {
+            "url": url,
+            "status_code": 200,
+            "text": LAWFARE_AND_CRITICAL_THREATS_HTML,
+            "headers": {"content-type": "text/html"},
+            "via": "browser_cdp_gui",
+            "solved": True,
+        }
+
+    monkeypatch.setattr("app.collectors.browser_fetcher.find_local_browser_executable", lambda: "/usr/bin/chromium")
+    monkeypatch.setattr("app.collectors.browser_fetcher._can_use_gui_fallback", lambda: True)
+    monkeypatch.setattr("app.collectors.browser_fetcher._run_single_browser_attempt", _fake_attempt)
+
+    res = await fetch_via_local_browser("https://www.bicom.org.uk/")
+    assert res is not None
+    assert res["status_code"] == 200
+    assert res["via"] == "browser_cdp_gui"
+    assert calls == [True, False]
+    assert "bicom.org.uk" in _GUI_REQUIRED_DOMAINS
+    _GUI_REQUIRED_DOMAINS.clear()
+
+
+async def test_dead_404_subpath_rescues_from_root_and_sso_redirect_rescues_public_portal(
+    monkeypatch, waf_server: str
+):
+    collector = WebSiteCollector()
+    settings = dict(DEFAULT_SETTINGS)
+
+    # 1. Dead subpath /nonexistent-news-path (404) rescues from root (wp_api on waf_server)
+    batch_404 = await collector.fetch_site_posts(
+        site={"canonical_url": f"{waf_server}/news"},
+        settings=settings,
+    )
+    assert batch_404.source_mode == "wp_api"
+    assert len(batch_404.posts) == 1
+
+    # 2. SSO redirect detection & automatic rescue from pro.<domain> (intel.morningconsult.com -> pro.morningconsult.com)
+    sso_resp = HttpFetchResponse(
+        url="https://accounts.morningconsult.com/oauth2/aus267/v1/authorize?client_id=abc&redirect_uri=https://intel.morningconsult.com",
+        status_code=200,
+        text="<html><title>Sign in to Morning Consult</title></html>",
+        headers={"content-type": "text/html"},
+    )
+    assert _is_sso_login_wall(sso_resp, "https://intel.morningconsult.com/") is True
+
+    async def _mock_get(self, url, **kwargs):
+        if "intel.morningconsult.com" in url:
+            return sso_resp
+        if "pro.morningconsult.com" in url:
+            return HttpFetchResponse(
+                url="https://intel.morningconsult.com/mc-content",
+                status_code=200,
+                text=MORNING_CONSULT_MC_CONTENT_HTML,
+                headers={"content-type": "text/html; charset=utf-8"},
+            )
+        return HttpFetchResponse(url=url, status_code=404, text="not found", headers={})
+
+    monkeypatch.setattr(SmartHttpFetcher, "get", _mock_get)
+    mc_batch = await collector.fetch_site_posts(
+        site={"canonical_url": "https://intel.morningconsult.com/"},
+        settings=settings,
+    )
+    assert mc_batch.source_mode == "html"
+    assert len(mc_batch.posts) == 2
+    assert mc_batch.posts[0].title == "U.S. Consumer Spending Tracker"
+

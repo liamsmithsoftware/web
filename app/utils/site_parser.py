@@ -93,6 +93,76 @@ def _strip_www(host: str) -> str:
     return lowered
 
 
+MULTIPART_PUBLIC_SUFFIXES = {
+    "co.uk",
+    "org.uk",
+    "ac.uk",
+    "gov.uk",
+    "me.uk",
+    "net.uk",
+    "co.ir",
+    "ac.ir",
+    "gov.ir",
+    "org.ir",
+    "id.ir",
+    "sch.ir",
+    "net.ir",
+    "com.au",
+    "net.au",
+    "org.au",
+    "edu.au",
+    "gov.au",
+    "co.jp",
+    "or.jp",
+    "ne.jp",
+    "com.br",
+    "com.tr",
+    "org.tr",
+    "gov.tr",
+    "co.il",
+    "org.il",
+    "co.in",
+    "org.in",
+    "com.cn",
+    "org.cn",
+    "co.za",
+    "co.nz",
+    "com.sg",
+    "com.my",
+    "com.pk",
+}
+
+
+def extract_registrable_domain(url_or_host: str) -> str:
+    """
+    Returns the registrable base domain (eTLD+1), e.g.:
+      - 'https://www.bicom.org.uk/news' -> 'bicom.org.uk'
+      - 'https://pro.morningconsult.com/trackers' -> 'morningconsult.com'
+      - 'https://intel.morningconsult.com/' -> 'morningconsult.com'
+      - 'http://127.0.0.1:8000/' -> '127.0.0.1'
+    """
+    raw = (url_or_host or "").strip()
+    if not raw:
+        return ""
+    host = (urlparse(raw).hostname if "://" in raw else raw.split("/", 1)[0].split(":", 1)[0]) or ""
+    host = _strip_www(host.strip().lower().rstrip("."))
+    if not host or host == "localhost":
+        return host
+    try:
+        ipaddress.ip_address(host)
+        return host
+    except ValueError:
+        pass
+
+    labels = [lbl for lbl in host.split(".") if lbl]
+    if len(labels) <= 2:
+        return host
+    last_two = f"{labels[-2]}.{labels[-1]}"
+    if last_two in MULTIPART_PUBLIC_SUFFIXES and len(labels) >= 3:
+        return f"{labels[-3]}.{last_two}"
+    return last_two
+
+
 def _clean_query(query: str) -> str:
     if not query:
         return ""

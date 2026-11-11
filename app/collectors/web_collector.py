@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from typing import Any, Dict, List, Optional
 from urllib.parse import urljoin, urlparse, urlunparse
 
@@ -9,6 +10,7 @@ from app.collectors.base import (
     FetchBatchResult,
     FetchedPost,
 )
+from app.collectors.browser_fetcher import CLEARANCE_CACHE
 from app.collectors.feed_parser import (
     discover_feed_urls_in_html,
     is_feed_document,
@@ -28,7 +30,11 @@ from app.collectors.wp_api_parser import (
     parse_wp_posts_json,
 )
 from app.config import DEFAULT_TIMEZONE
-from app.utils.site_parser import looks_like_feed_url, parse_site_input
+from app.utils.site_parser import (
+    extract_registrable_domain,
+    looks_like_feed_url,
+    parse_site_input,
+)
 
 COMMON_ROOT_FEED_PATHS = (
     "/feed/",
@@ -44,6 +50,29 @@ COMMON_SITEMAP_PATHS = (
     "/post-sitemap.xml",
     "/sitemap_index.xml",
     "/sitemap.xml",
+)
+
+SSO_AUTH_HOST_PREFIXES = (
+    "accounts.",
+    "account.",
+    "login.",
+    "auth.",
+    "sso.",
+    "id.",
+)
+
+SSO_IDP_DOMAINS = (
+    "okta.com",
+    "oktapreview.com",
+    "auth0.com",
+    "microsoftonline.com",
+    "onelogin.com",
+    "duosecurity.com",
+)
+
+SSO_AUTH_PATH_RE = re.compile(
+    r"(?:^|/)(?:oauth2?|openid-connect|saml2?|sso|login|signin|sign-in|wp-login\.php)(?:/|$)",
+    re.IGNORECASE,
 )
 
 
@@ -73,10 +102,74 @@ def _https_upgrade_candidate(url: str) -> Optional[str]:
     return urlunparse(("https", netloc, parsed.path or "/", parsed.params, parsed.query, ""))
 
 
+def _is_sso_login_wall(resp: HttpFetchResponse, requested_url: str) -> bool:
+    """Detects when a URL redirected to an OAuth/Okta/SSO enterprise login gate."""
+    final_u = (resp.url or "").strip()
+    req_u = (requested_url or "").strip()
+    if not final_u or not req_u:
+        return False
+
+    p_final = urlparse(final_u)
+    p_req = urlparse(req_u)
+    final_host = (p_final.hostname or "").lower().rstrip(".")
+    req_host = (p_req.hostname or "").lower().rstrip(".")
+    final_path = (p_final.path or "/").rstrip("/").lower() or "/"
+    req_path = (p_req.path or "/").rstrip("/").lower() or "/"
+
+    # Only flag when the server actually redirected away from the requested location
+    if final_host == req_host and final_path == req_path:
+        return False
+
+    if final_host != req_host and (
+        final_host.startswith(SSO_AUTH_HOST_PREFIXES)
+        or any(final_host == d or final_host.endswith("." + d) for d in SSO_IDP_DOMAINS)
+    ):
+        return True
+
+    query_low = (p_final.query or "").lower()
+    if "client_id=" in query_low and ("redirect_uri=" in query_low or "response_type=" in query_low):
+        return True
+
+    if SSO_AUTH_PATH_RE.search(final_path):
+        return True
+
+    return False
+
+
+def _public_portal_candidates_for_sso(requested_url: str) -> List[str]:
+    """
+    When a private/enterprise subdomain (e.g. `intel.morningconsult.com`) redirects to SSO,
+    returns likely public sibling/root portals (`pro.<domain>`, `<domain>`).
+    """
+    parsed = urlparse(requested_url)
+    host = (parsed.hostname or "").lower().rstrip(".")
+    reg_domain = extract_registrable_domain(host)
+    if not host or not reg_domain:
+        return []
+
+    bare_host = host[4:] if host.startswith("www.") else host
+    # Only try sibling/root portals when the user entered a specific subdomain like intel.<domain>
+    if bare_host == reg_domain:
+        return []
+
+    candidates: List[str] = []
+    for cand_host in (f"pro.{reg_domain}", reg_domain):
+        if cand_host != bare_host:
+            candidates.append(f"https://{cand_host}/")
+    return candidates
+
+
+def _raise_sso_login_error() -> None:
+    raise CollectorError(
+        "این آدرس به صفحه ورود یا اشتراک سازمانی (SSO/Login) هدایت شد و بدون حساب کاربری قابل دسترس نیست. "
+        "لطفاً آدرس بخش عمومی وب‌سایت را وارد کنید."
+    )
+
+
 class WebSiteCollector:
     """
     Hybrid Anti-403 Website Collector supporting:
-      - 'auto': Smart RSS/Atom + WordPress REST API + HTML scraping + Sitemap rescue
+      - 'auto': Smart RSS/Atom + WordPress REST API + HTML scraping + Sitemap + Root/Public Portal rescue
       - 'rss':  Strict RSS / Atom / JSON Feed reader
       - 'html': Direct HTML listing & article scraper
     Powered by SmartHttpFetcher (HTTP/2 + curl_cffi TLS/JA3 + Local Edge/Chrome CDP + Proxy/Direct failover).
@@ -121,22 +214,16 @@ class WebSiteCollector:
         referer: Optional[str] = None,
     ) -> HttpFetchResponse:
         """
-        Fetches `url`; if it was a plain `http://` public URL that failed or returned 4xx/5xx
-        (common with ISP plain-HTTP DPI or Cloudflare 'Always Use HTTPS' WAF rules),
-        automatically retries over `https://`.
+        Prefers `https://` first for plain `http://` public URLs (avoiding plain-HTTP DPI
+        and Cloudflare HTTP bot penalties), falling back to `http://` only if HTTPS fails to connect.
         """
         https_twin = _https_upgrade_candidate(url)
-        try:
-            resp = await fetcher.get(url, accept_kind=accept_kind, referer=referer)
-            if resp.status_code >= 400 and https_twin and resp.url.startswith("http://"):
-                https_resp = await fetcher.get(https_twin, accept_kind=accept_kind, referer=referer)
-                if https_resp.status_code < 400:
-                    return https_resp
-            return resp
-        except CollectorError:
-            if https_twin:
+        if https_twin:
+            try:
                 return await fetcher.get(https_twin, accept_kind=accept_kind, referer=referer)
-            raise
+            except CollectorError:
+                return await fetcher.get(url, accept_kind=accept_kind, referer=referer)
+        return await fetcher.get(url, accept_kind=accept_kind, referer=referer)
 
     async def _try_parse_feed_or_wp_response(
         self,
@@ -187,6 +274,8 @@ class WebSiteCollector:
             accept_kind = "json" if "/wp-json/" in candidate else "document"
             try:
                 resp = await fetcher.get(candidate, accept_kind=accept_kind, referer=origin)
+                if _is_sso_login_wall(resp, candidate):
+                    continue
                 parsed = await self._try_parse_feed_or_wp_response(
                     resp, base_url=base_url, tz_name=tz_name
                 )
@@ -263,6 +352,39 @@ class WebSiteCollector:
             endpoints.append(urljoin(base_slash, "rss"))
         return endpoints
 
+    async def _rescue_sso_public_portal(
+        self,
+        fetcher: SmartHttpFetcher,
+        requested_url: str,
+        tz_name: str,
+        *,
+        html_only: bool = False,
+    ) -> Optional[FetchBatchResult]:
+        for portal_url in _public_portal_candidates_for_sso(requested_url):
+            try:
+                if html_only:
+                    p_resp = await self._get_with_https_upgrade(fetcher, portal_url)
+                    if p_resp.status_code == 200 and not _is_sso_login_wall(p_resp, portal_url):
+                        title, posts = extract_listing_posts(
+                            p_resp.text, page_url=p_resp.url or portal_url, tz_name=tz_name
+                        )
+                        if posts:
+                            return FetchBatchResult(
+                                site_title=title,
+                                posts=posts,
+                                source_mode="html",
+                                discovered_feed_url=None,
+                            )
+                else:
+                    batch = await self._fetch_via_auto(
+                        fetcher, portal_url, None, tz_name, _allow_sso_portal_rescue=False
+                    )
+                    if batch.posts:
+                        return batch
+            except CollectorError:
+                continue
+        return None
+
     async def _fetch_via_html(
         self,
         fetcher: SmartHttpFetcher,
@@ -270,6 +392,22 @@ class WebSiteCollector:
         tz_name: str,
     ) -> FetchBatchResult:
         resp = await self._get_with_https_upgrade(fetcher, canonical_url)
+
+        if _is_sso_login_wall(resp, canonical_url):
+            rescued = await self._rescue_sso_public_portal(
+                fetcher, canonical_url, tz_name, html_only=True
+            )
+            if rescued is not None:
+                return rescued
+            _raise_sso_login_error()
+
+        # If a guessed subpath like /news returns 404/410, rescue from the root homepage
+        if resp.status_code in (404, 410) and not _is_root_like_url(canonical_url):
+            origin = _origin_of(resp.url or canonical_url)
+            root_resp = await self._get_with_https_upgrade(fetcher, origin)
+            if root_resp.status_code == 200 and not _is_sso_login_wall(root_resp, origin):
+                resp = root_resp
+
         resp.raise_for_status()
 
         direct = await self._try_parse_feed_or_wp_response(
@@ -301,6 +439,9 @@ class WebSiteCollector:
                 return res
 
         resp = await self._get_with_https_upgrade(fetcher, canonical_url)
+        if _is_sso_login_wall(resp, canonical_url):
+            _raise_sso_login_error()
+
         final_url = resp.url or canonical_url
         is_root = _is_root_like_url(final_url)
 
@@ -319,8 +460,15 @@ class WebSiteCollector:
             if "/wp-json/" not in ep and ep not in candidates:
                 candidates.append(ep)
 
+        # If a guessed section path like /news returned 404/410, also check root feeds (/feed/, /rss.xml)
+        if not is_root and resp.status_code in (404, 410):
+            origin = _origin_of(final_url)
+            for ep in self._build_blind_fallback_endpoints(origin, is_root=True):
+                if "/wp-json/" not in ep and ep not in candidates:
+                    candidates.append(ep)
+
         found = await self._probe_candidate_endpoints(
-            fetcher, candidates[:7], base_url=final_url, tz_name=tz_name
+            fetcher, candidates[:8], base_url=final_url, tz_name=tz_name
         )
         if found is not None:
             return found
@@ -338,6 +486,8 @@ class WebSiteCollector:
         canonical_url: str,
         known_feed_url: Optional[str],
         tz_name: str,
+        *,
+        _allow_sso_portal_rescue: bool = True,
     ) -> FetchBatchResult:
         # 1. Try previously discovered feed/API endpoint or explicit feed URL first
         if known_feed_url or looks_like_feed_url(canonical_url) or "/wp-json/" in canonical_url:
@@ -354,27 +504,73 @@ class WebSiteCollector:
             if (looks_like_feed_url(canonical_url) or "/wp-json/" in canonical_url) and not known_feed_url:
                 resp.raise_for_status()
 
-        # 2. Fetch the main target URL (with automatic http:// -> https:// upgrade if needed)
+        # 2. Fetch the main target URL (preferring https:// for plain http:// public URLs)
         resp = await self._get_with_https_upgrade(fetcher, canonical_url)
+
+        # 2a. Detect enterprise SSO/OAuth login redirects (e.g. intel.morningconsult.com -> Okta)
+        if _is_sso_login_wall(resp, canonical_url):
+            if _allow_sso_portal_rescue:
+                rescued_portal = await self._rescue_sso_public_portal(
+                    fetcher, canonical_url, tz_name, html_only=False
+                )
+                if rescued_portal is not None:
+                    return rescued_portal
+            _raise_sso_login_error()
+
         final_url = resp.url or canonical_url
         is_root = _is_root_like_url(final_url)
 
-        # Anti-403 resilience: if main page is blocked by WAF (403/503), probe feeds, WP API, and sitemaps!
+        # 2b. Anti-403 & Dead-Subpath (404) resilience
         if resp.status_code >= 400:
-            # Avoid spawning multiple browsers during blind probes
+            blind_eps = self._build_blind_fallback_endpoints(final_url, is_root=is_root)
             fast_probe_fetcher = SmartHttpFetcher(fetcher.settings, allow_browser_fallback=False)
+
+            # If root returned 403/503 without solving cf_clearance yet, let primary `/feed/` try browser once
+            if (
+                blind_eps
+                and resp.status_code in (401, 403, 406, 429, 503)
+                and fetcher.allow_browser_fallback
+                and CLEARANCE_CACHE.get(final_url, None) is None
+            ):
+                first_try = await self._probe_candidate_endpoints(
+                    fetcher, blind_eps[:1], base_url=final_url, tz_name=tz_name
+                )
+                if first_try is not None:
+                    return first_try
+                blind_eps = blind_eps[1:]
+
             rescued = await self._probe_candidate_endpoints(
                 fast_probe_fetcher,
-                self._build_blind_fallback_endpoints(final_url, is_root=is_root),
+                blind_eps,
                 base_url=final_url,
                 tz_name=tz_name,
             )
             if rescued is not None:
                 return rescued
+
+            # Dead subpath rescue (e.g. https://www.navaltoday.com/news -> 404 -> rescue from root /feed/ or /)
+            if not is_root and resp.status_code in (404, 410):
+                origin = _origin_of(final_url)
+                root_feed_rescued = await self._probe_candidate_endpoints(
+                    fast_probe_fetcher,
+                    self._build_blind_fallback_endpoints(origin, is_root=True),
+                    base_url=origin,
+                    tz_name=tz_name,
+                )
+                if root_feed_rescued is not None:
+                    return root_feed_rescued
+                try:
+                    return await self._fetch_via_auto(
+                        fetcher, origin, None, tz_name, _allow_sso_portal_rescue=False
+                    )
+                except CollectorError:
+                    pass
+
             if is_root and resp.status_code in (401, 403, 406, 429, 503):
                 sm_rescued = await self._probe_sitemap_rescue(fetcher.settings, final_url, tz_name)
                 if sm_rescued is not None:
                     return sm_rescued
+
             resp.raise_for_status()
 
         # 3. Direct feed or WP REST JSON document
@@ -404,7 +600,7 @@ class WebSiteCollector:
             if found is not None:
                 return found
 
-        # 6. Scrape HTML listing directly (handles custom portals like iiss.org)
+        # 6. Scrape HTML listing directly (handles custom portals like iiss.org, lawfaremedia.org, criticalthreats.org)
         try:
             title, posts = extract_listing_posts(resp.text, page_url=final_url, tz_name=tz_name)
             return FetchBatchResult(
@@ -458,7 +654,7 @@ class WebSiteCollector:
                     resp = await self._get_with_https_upgrade(
                         fetcher, post.post_url, referer=_origin_of(post.post_url)
                     )
-                    if resp.status_code != 200:
+                    if resp.status_code != 200 or _is_sso_login_wall(resp, post.post_url):
                         return
                     details = extract_article_details(
                         resp.text, article_url=resp.url, tz_name=tz_name

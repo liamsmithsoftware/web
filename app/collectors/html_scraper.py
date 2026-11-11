@@ -12,17 +12,83 @@ from bs4 import BeautifulSoup, Tag
 
 from app.collectors.base import CollectorError, FetchedPost
 from app.utils.jalali import parse_any_datetime
-from app.utils.site_parser import compute_post_guid, normalize_article_url, normalize_digits
+from app.utils.site_parser import (
+    compute_post_guid,
+    extract_registrable_domain,
+    normalize_article_url,
+    normalize_digits,
+)
 
 SKIP_PATH_PATTERNS = re.compile(
     r"(?:^|/)(?:"
     r"login|signin|sign-in|signup|sign-up|register|logout|account|profile|cart|checkout|"
     r"contact|contact-us|about|about-us|privacy|privacy-policy|terms|faq|ads|advertise|"
     r"donate|subscribe|newsletter|careers|jobs|press-kit|capabilities|sectors|services|partners|"
+    r"solutions|products|featured-insights|"
     r"search|wp-login\.php|wp-admin|wp-json|xmlrpc\.php|feed|rss|atom|sitemap|"
-    r"tag|tags|issue|issues|topic|topics|category|categories|team|staff|experts|"
-    r"author|authors|users|comment|comments|reply"
+    r"tag|tags|issue|issues|topic|topics|vertical|verticals|category|categories|team|staff|experts|"
+    r"author|authors|contributor|contributors|users|webusers|comment|comments|reply"
     r")(?:/|$|\?)",
+    re.IGNORECASE,
+)
+
+SECTION_HUB_SLUGS = {
+    "news",
+    "articles",
+    "article",
+    "posts",
+    "post",
+    "blog",
+    "reports",
+    "report",
+    "analysis",
+    "research",
+    "insights",
+    "publications",
+    "podcasts",
+    "trackers",
+    "analyst-reports",
+    "webinars",
+    "events",
+    "press",
+    "press-releases",
+    "media",
+    "videos",
+    "opinions",
+    "commentary",
+    "briefs",
+    "highlights",
+    "archive",
+    "archives",
+}
+
+EXCLUDED_SUBDOMAIN_PREFIXES = (
+    "accounts.",
+    "account.",
+    "login.",
+    "auth.",
+    "sso.",
+    "id.",
+    "mail.",
+    "shop.",
+    "store.",
+    "donate.",
+    "careers.",
+    "jobs.",
+    "status.",
+    "support.",
+    "help.",
+)
+
+NAV_ANCHOR_TEXT_RE = re.compile(
+    r"^(?:view\s+all|see\s+all|read\s+all|browse\s+all|show\s+all|explore\s+all|"
+    r"all\s+articles|all\s+posts|all\s+news|all\s+reports|more\s+news|load\s+more|"
+    r"read\s+more|learn\s+more|مشاهده\s+همه|همه\s+اخبار|همه\s+مطالب|بیشتر\s+بخوانید|ادامه\s+مطلب)\b",
+    re.IGNORECASE,
+)
+
+LEADING_BADGE_RE = re.compile(
+    r"^(?:article\s+|related:\s*|featured\s+|new:\s*)",
     re.IGNORECASE,
 )
 
@@ -35,6 +101,7 @@ ARTICLE_HINT_URL_RE = re.compile(
     r"(?:/\d{4}/\d{1,2}/|/\d{4,}|"
     r"/(?:news|post|posts|article|articles|blog|story|content|fa/news|detail|view|"
     r"online-analysis|strategic-comments|military-balance|"
+    r"trackers|tracker|analyst-reports|analyst-report|company-news|webinars|resources|"
     r"analysis|podcasts|podcast|in_the_news|research|reports|report|insights|insight|"
     r"publications|publication|commentary|opinions|opinion|briefs|brief|press-releases)/|"
     r"[?&](?:p|id|newsid)=\d+)",
@@ -87,11 +154,19 @@ def parse_views_text(raw_views: Optional[str]) -> Optional[int]:
 
 
 def _same_site_domain(url_a: str, url_b: str) -> bool:
-    host_a = (urlparse(url_a).hostname or "").lower().lstrip("www.")
-    host_b = (urlparse(url_b).hostname or "").lower().lstrip("www.")
+    host_a = (urlparse(url_a).hostname or "").lower().rstrip(".")
+    host_b = (urlparse(url_b).hostname or "").lower().rstrip(".")
     if not host_a or not host_b:
         return False
-    return host_a == host_b or host_a.endswith("." + host_b) or host_b.endswith("." + host_a)
+    bare_a = host_a[4:] if host_a.startswith("www.") else host_a
+    bare_b = host_b[4:] if host_b.startswith("www.") else host_b
+    if bare_a == bare_b:
+        return True
+    if bare_a != bare_b and bare_a.startswith(EXCLUDED_SUBDOMAIN_PREFIXES):
+        return False
+    reg_a = extract_registrable_domain(bare_a)
+    reg_b = extract_registrable_domain(bare_b)
+    return bool(reg_a and reg_a == reg_b)
 
 
 def _is_candidate_article_url(candidate_url: str, page_url: str) -> bool:
@@ -113,6 +188,19 @@ def _is_candidate_article_url(candidate_url: str, page_url: str) -> bool:
     # Skip pagination links like /page/2 or ?page=2
     if re.search(r"(?:/page/\d+/?$|[?&]page=\d+)", candidate_url, re.IGNORECASE):
         return False
+
+    # Skip bare section index hubs like /reports, /analysis, /news, or /article/highlights
+    segments = [seg.lower() for seg in path.split("/") if seg]
+    if not parsed.query:
+        if len(segments) == 1 and segments[0] in SECTION_HUB_SLUGS:
+            return False
+        if (
+            len(segments) == 2
+            and segments[0] in SECTION_HUB_SLUGS
+            and segments[1] in ("highlights", "all", "archive", "archives", "latest")
+        ):
+            return False
+
     return True
 
 
@@ -147,6 +235,80 @@ def _extract_img_url(container: Tag, base_url: str) -> Optional[str]:
         if first and not first.startswith("data:"):
             return urljoin(base_url, first)
     return None
+
+
+def _is_single_card_box(box: Optional[Tag]) -> bool:
+    if box is None:
+        return False
+    txt = box.get_text(" ", strip=True)
+    if len(txt) > 800:
+        return False
+    if len(box.find_all(["h1", "h2", "h3", "h4"])) > 2:
+        return False
+    return len(box.find_all("a", href=True)) <= 5
+
+
+def _clean_headline_text(raw_title: str) -> str:
+    cleaned = re.sub(r"\s+", " ", (raw_title or "")).strip()
+    cleaned = LEADING_BADGE_RE.sub("", cleaned).strip()
+    return cleaned
+
+
+def _extract_clean_title_from_anchor(
+    a_tag: Tag,
+    fallback_container: Optional[Tag] = None,
+) -> Tuple[str, bool, str]:
+    """
+    Returns (clean_title, is_emphasized_heading, full_anchor_text).
+    Handles cards where <a> wraps badge + <h3>/<strong> + summary + date.
+    """
+    full_anchor_text = re.sub(r"\s+", " ", a_tag.get_text(" ", strip=True)).strip()
+
+    h_inside = a_tag.find(["h1", "h2", "h3", "h4", "h5", "h6"])
+    title_el = h_inside or a_tag.select_one('[class*="title"], [class*="headline"], [class*="heading"]')
+    if not title_el:
+        strong_el = a_tag.find(["strong", "b"])
+        if strong_el and len(strong_el.get_text(" ", strip=True)) >= 10:
+            title_el = strong_el
+
+    if title_el and len(title_el.get_text(" ", strip=True)) >= 6:
+        title = _clean_headline_text(title_el.get_text(" ", strip=True))
+        return title, True, full_anchor_text
+
+    if fallback_container is not None:
+        h_card = fallback_container.find(["h1", "h2", "h3", "h4"])
+        if h_card and len(h_card.get_text(" ", strip=True)) >= 6:
+            title = _clean_headline_text(h_card.get_text(" ", strip=True))
+            return title, True, full_anchor_text
+
+    in_parent_heading = a_tag.find_parent(["h1", "h2", "h3", "h4", "h5", "h6"]) is not None
+    return _clean_headline_text(full_anchor_text), in_parent_heading, full_anchor_text
+
+
+def _extract_best_card_datetime(
+    a_tag: Tag,
+    card_box: Optional[Tag],
+    full_anchor_text: str,
+    tz_name: str,
+) -> Optional[datetime]:
+    pub_dt = _extract_datetime_from_tag(a_tag, tz_name=tz_name)
+    if pub_dt is None and card_box is not None and card_box is not a_tag:
+        pub_dt = _extract_datetime_from_tag(card_box, tz_name=tz_name)
+    if pub_dt is None and full_anchor_text:
+        # Scan tail first (bylines like "...By Author 6th November 2026" or "...2 days ago"), then head
+        tail_snippet = full_anchor_text[-140:] if len(full_anchor_text) > 140 else ""
+        pub_dt = (
+            parse_any_datetime(tail_snippet, tz_name=tz_name)
+            or parse_any_datetime(full_anchor_text[:240], tz_name=tz_name)
+        )
+    if pub_dt is None and card_box is not None and card_box is not a_tag and _is_single_card_box(card_box):
+        box_text = re.sub(r"\s+", " ", card_box.get_text(" ", strip=True)).strip()
+        tail_box = box_text[-140:] if len(box_text) > 140 else ""
+        pub_dt = (
+            parse_any_datetime(tail_box, tz_name=tz_name)
+            or parse_any_datetime(box_text[:260], tz_name=tz_name)
+        )
+    return pub_dt
 
 
 def _extract_datetime_from_tag(container: Tag, tz_name: str) -> Optional[datetime]:
@@ -339,11 +501,8 @@ def extract_listing_posts(
         if not guid or guid in posts_by_guid:
             continue
 
-        title = chosen_a.get_text(" ", strip=True)
-        if not title:
-            h_el = card.find(["h1", "h2", "h3", "h4"])
-            title = h_el.get_text(" ", strip=True) if h_el else ""
-        if len(title) < 4:
+        title, _, full_anchor_text = _extract_clean_title_from_anchor(chosen_a, fallback_container=card)
+        if len(title) < 4 or (len(title) <= 45 and NAV_ANCHOR_TEXT_RE.search(title)):
             continue
 
         # Extract summary paragraphs inside card
@@ -355,7 +514,7 @@ def extract_listing_posts(
         summary = "\n".join(summary_parts[:2]).strip()
         content = f"{title}\n\n{summary}".strip() if summary else title
 
-        pub_dt = _extract_datetime_from_tag(card, tz_name=tz_name)
+        pub_dt = _extract_best_card_datetime(chosen_a, card, full_anchor_text, tz_name=tz_name)
         img_url = _extract_img_url(card, norm_url)
 
         views_el = card.select_one('[class*="view"], [class*="visit"]')
@@ -364,7 +523,7 @@ def extract_listing_posts(
         post = FetchedPost(
             post_guid=guid,
             post_url=norm_url,
-            title=title,
+            title=title[:240],
             published_at=pub_dt,
             content=content,
             media_type="photo" if img_url else "text",
@@ -386,22 +545,10 @@ def extract_listing_posts(
             if not guid or guid in posts_by_guid:
                 continue
 
-            h_inside = a_tag.find(["h1", "h2", "h3", "h4", "h5", "h6"])
-            title_el = h_inside or a_tag.select_one('[class*="title"], [class*="headline"], [class*="heading"]')
-            if not title_el:
-                strong_el = a_tag.find(["strong", "b"])
-                if strong_el and len(strong_el.get_text(" ", strip=True)) >= 12:
-                    title_el = strong_el
+            text, in_heading, full_anchor_text = _extract_clean_title_from_anchor(a_tag)
+            if len(text) <= 45 and NAV_ANCHOR_TEXT_RE.search(text):
+                continue
 
-            full_anchor_text = re.sub(r"\s+", " ", a_tag.get_text(" ", strip=True)).strip()
-            if title_el and len(title_el.get_text(" ", strip=True)) >= 8:
-                text = re.sub(r"\s+", " ", title_el.get_text(" ", strip=True)).strip()
-            else:
-                text = full_anchor_text
-
-            in_heading = a_tag.find_parent(["h1", "h2", "h3", "h4", "h5", "h6"]) is not None or bool(
-                h_inside or title_el
-            )
             url_looks_article = bool(ARTICLE_HINT_URL_RE.search(norm_url)) or norm_url.count("/") >= 4
 
             # Require meaningful headline length so navigation items like "ورزشی" or "ادامه" are skipped
@@ -409,30 +556,20 @@ def extract_listing_posts(
             if len(text) < min_len:
                 continue
 
+            parent_box = a_tag.find_parent(["li", "div", "section"]) or a_tag
+            single_box = _is_single_card_box(parent_box)
+
+            summary_source = parent_box if (parent_box is not a_tag and single_box) else a_tag
             card_summary_parts = [
                 p_el.get_text(" ", strip=True)
-                for p_el in a_tag.find_all("p")
+                for p_el in summary_source.find_all("p")
                 if len(p_el.get_text(" ", strip=True)) >= 20
                 and p_el.get_text(" ", strip=True) != text
             ]
             card_content = f"{text}\n\n{card_summary_parts[0]}".strip() if card_summary_parts else text
 
-            parent_box = a_tag.find_parent(["li", "div", "section"]) or a_tag
-            pub_dt = _extract_datetime_from_tag(a_tag, tz_name=tz_name) or _extract_datetime_from_tag(
-                parent_box, tz_name=tz_name
-            )
-            if pub_dt is None:
-                # Scan tail first (bylines like "...By Author 6th November 2026" on iiss.org), then head
-                tail_snippet = full_anchor_text[-140:] if len(full_anchor_text) > 140 else ""
-                pub_dt = (
-                    parse_any_datetime(tail_snippet, tz_name=tz_name)
-                    or parse_any_datetime(full_anchor_text[:240], tz_name=tz_name)
-                )
-            if pub_dt is None and parent_box is not a_tag:
-                # Sibling date label above/below heading (e.g. bicom.org.uk Elementor cards)
-                box_snippet = re.sub(r"\s+", " ", parent_box.get_text(" ", strip=True))[:220]
-                pub_dt = parse_any_datetime(box_snippet, tz_name=tz_name)
-            img_url = _extract_img_url(parent_box, norm_url)
+            pub_dt = _extract_best_card_datetime(a_tag, parent_box, full_anchor_text, tz_name=tz_name)
+            img_url = _extract_img_url(parent_box if single_box else a_tag, norm_url)
 
             post = FetchedPost(
                 post_guid=guid,

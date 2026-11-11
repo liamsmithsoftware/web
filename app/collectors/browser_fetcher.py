@@ -1,8 +1,8 @@
 """
-لایه مرورگر واقعی بدون پنجره (Stealth Raw CDP over Local Chrome / Microsoft Edge)
-برای عبور خودکار از چالش‌های جاوااسکریپتی Cloudflare (JS Managed Challenge) بدون
-نیاز به دانلود مرورگر جداگانه (در ویندوز ۱۰ و ۱۱ به صورت پیش‌فرض از Edge یا Chrome
-نصب‌شده روی سیستم استفاده می‌کند) و بدون فعال‌سازی Runtime.enable.
+لایه مرورگر واقعی بدون پنجره مزاحم (Stealth Raw CDP over Local Chrome / Microsoft Edge)
+برای عبور خودکار از چالش‌های جاوااسکریپتی Cloudflare و Turnstile بدون نیاز به دانلود
+مرورگر جداگانه (در ویندوز ۱۰ و ۱۱ به صورت پیش‌فرض از Edge یا Chrome نصب‌شده روی سیستم
+استفاده می‌کند)، با بازنویسی کامل Client Hints (Sec-Ch-Ua) و بدون فعال‌سازی Runtime.enable.
 """
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ import base64
 import http.client
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -19,8 +20,10 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse
+
+from app.utils.site_parser import extract_registrable_domain
 
 try:
     from websockets.asyncio.client import connect as ws_connect  # type: ignore
@@ -43,7 +46,48 @@ CHALLENGE_TITLE_MARKERS = (
     "ddos-guard",
     "security check",
     "one moment, please",
+    "verifying you are human",
+    "verify you are human",
 )
+
+ACTIVE_CHALLENGE_DOM_MARKERS = (
+    "window._cf_chl_opt",
+    'id="challenge-running"',
+    'id="challenge-stage"',
+    'id="cf-challenge-running"',
+    'id="turnstile-wrapper"',
+    'class="cf-turnstile"',
+    "challenges.cloudflare.com/turnstile",
+    "/cdn-cgi/challenge-platform/h/",
+)
+
+STEALTH_INIT_SCRIPT = """
+(() => {
+    try {
+        if (navigator.webdriver) {
+            Object.defineProperty(navigator, 'webdriver', {
+                get: () => false,
+                configurable: true
+            });
+        }
+        if (!window.chrome) {
+            Object.defineProperty(window, 'chrome', {
+                value: { runtime: {}, app: { isInstalled: false } },
+                configurable: true
+            });
+        }
+        if (!window.outerWidth || window.outerWidth === 0) {
+            Object.defineProperty(window, 'outerWidth', { get: () => window.innerWidth || 1366, configurable: true });
+        }
+        if (!window.outerHeight || window.outerHeight === 0) {
+            Object.defineProperty(window, 'outerHeight', { get: () => (window.innerHeight || 700) + 68, configurable: true });
+        }
+        if (!navigator.languages || navigator.languages.length === 0) {
+            Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'], configurable: true });
+        }
+    } catch (_) {}
+})();
+"""
 
 
 @dataclass
@@ -63,11 +107,13 @@ class DomainClearanceCache:
 
     @staticmethod
     def _base_domain(url: str) -> str:
-        host = (urlparse(url).hostname or "").lower().lstrip("www.")
-        return host
+        return extract_registrable_domain(url)
 
     def get(self, url: str, proxy_url: Optional[str]) -> Optional[ClearanceEntry]:
-        key = (self._base_domain(url), proxy_url or "direct")
+        domain = self._base_domain(url)
+        if not domain:
+            return None
+        key = (domain, proxy_url or "direct")
         entry = self._store.get(key)
         if not entry:
             return None
@@ -99,6 +145,8 @@ class DomainClearanceCache:
 
 CLEARANCE_CACHE = DomainClearanceCache()
 _BROWSER_SEMAPHORE = asyncio.Semaphore(2)
+# Domains whose strict Turnstile challenge required an off-screen non-headless window
+_GUI_REQUIRED_DOMAINS: Set[str] = set()
 
 
 def find_local_browser_executable() -> Optional[str]:
@@ -160,6 +208,15 @@ def find_local_browser_executable() -> Optional[str]:
     return None
 
 
+def _can_use_gui_fallback() -> bool:
+    """True when the OS has a desktop session where an off-screen minimized browser can run."""
+    if (os.getenv("WEB_COLLECTOR_HEADLESS_ONLY") or "").strip() == "1":
+        return False
+    if os.name == "nt" or sys.platform == "darwin":
+        return True
+    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
+
 def _pick_ephemeral_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))
@@ -184,14 +241,112 @@ def _http_get_local_json(port: int, path: str, timeout: float = 1.5) -> Any:
 
 
 def _looks_like_js_challenge(html: str) -> bool:
-    head = (html or "")[:6000].lower()
-    if not head:
+    raw = html or ""
+    if not raw.strip():
         return True
+    head = raw[:8192].lower()
     if any(m in head for m in CHALLENGE_TITLE_MARKERS) and (
-        "cloudflare" in head or "__cf_chl_" in head or "turnstile" in head or "challenge-platform" in head
+        "cloudflare" in head
+        or "__cf_chl_" in head
+        or "_cf_chl_opt" in head
+        or "turnstile" in head
+        or "challenge-platform" in head
+        or "ddos-guard" in head
     ):
         return True
+    # Newer Cloudflare Turnstile templates set <title> to the domain name while running _cf_chl_opt
+    if len(raw) < 48_000:
+        lower_body = raw.lower()
+        if any(marker in lower_body for marker in ACTIVE_CHALLENGE_DOM_MARKERS):
+            return True
     return False
+
+
+def _build_ua_override_params(raw_ua: str, browser_bin: str = "") -> Dict[str, Any]:
+    """
+    Constructs `Network.setUserAgentOverride` parameters including full `userAgentMetadata`
+    so `Sec-Ch-Ua` HTTP Client Hints AND `navigator.userAgentData` replace `HeadlessChrome`
+    with genuine `Google Chrome` or `Microsoft Edge` brands.
+    """
+    clean_ua = (raw_ua or "").replace("HeadlessChrome/", "Chrome/").strip()
+    if not clean_ua:
+        clean_ua = (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+        )
+
+    m_chrome = re.search(r"Chrome/(\d+)\.(\d+\.\d+\.\d+)", clean_ua)
+    chrome_major = m_chrome.group(1) if m_chrome else "131"
+    chrome_full = f"{chrome_major}.{m_chrome.group(2)}" if m_chrome else "131.0.0.0"
+
+    m_edge = re.search(r"Edg/(\d+)\.(\d+\.\d+\.\d+)", clean_ua)
+    is_edge = bool(m_edge) or ("msedge" in (browser_bin or "").lower())
+    edge_major = m_edge.group(1) if m_edge else chrome_major
+    edge_full = f"{edge_major}.{m_edge.group(2)}" if m_edge else chrome_full
+
+    if is_edge:
+        brands = [
+            {"brand": "Not(A:Brand", "version": "99"},
+            {"brand": "Microsoft Edge", "version": edge_major},
+            {"brand": "Chromium", "version": chrome_major},
+        ]
+        full_version_list = [
+            {"brand": "Not(A:Brand", "version": "99.0.0.0"},
+            {"brand": "Microsoft Edge", "version": edge_full},
+            {"brand": "Chromium", "version": chrome_full},
+        ]
+        primary_full_version = edge_full
+    else:
+        brands = [
+            {"brand": "Not(A:Brand", "version": "99"},
+            {"brand": "Google Chrome", "version": chrome_major},
+            {"brand": "Chromium", "version": chrome_major},
+        ]
+        full_version_list = [
+            {"brand": "Not(A:Brand", "version": "99.0.0.0"},
+            {"brand": "Google Chrome", "version": chrome_full},
+            {"brand": "Chromium", "version": chrome_full},
+        ]
+        primary_full_version = chrome_full
+
+    if os.name == "nt":
+        nav_platform = "Win32"
+        ch_platform = "Windows"
+        ch_platform_ver = "15.0.0"
+    elif sys.platform == "darwin":
+        nav_platform = "MacIntel"
+        ch_platform = "macOS"
+        ch_platform_ver = "14.5.0"
+    else:
+        nav_platform = "Linux x86_64"
+        ch_platform = "Linux"
+        ch_platform_ver = "6.5.0"
+
+    return {
+        "userAgent": clean_ua,
+        "acceptLanguage": "en-US,en;q=0.9,fa-IR;q=0.8",
+        "platform": nav_platform,
+        "userAgentMetadata": {
+            "brands": brands,
+            "fullVersionList": full_version_list,
+            "fullVersion": primary_full_version,
+            "platform": ch_platform,
+            "platformVersion": ch_platform_ver,
+            "architecture": "x86",
+            "bitness": "64",
+            "model": "",
+            "mobile": False,
+            "wow64": False,
+        },
+    }
+
+
+def _normalize_chromium_proxy(proxy_url: Optional[str]) -> Optional[str]:
+    if not proxy_url:
+        return None
+    if proxy_url.startswith("socks5h://"):
+        return "socks5://" + proxy_url[len("socks5h://") :]
+    return proxy_url
 
 
 class _RawCdpClient:
@@ -287,6 +442,284 @@ class _RawCdpClient:
             pass
 
 
+async def _nudge_turnstile_if_present(cdp: _RawCdpClient) -> None:
+    """
+    Provides natural pointer movement entropy for Cloudflare Managed Challenges and, if an
+    interactive Turnstile checkbox iframe is visible in the DOM, clicks its checkbox region.
+    Uses ONLY Input & DOM CDP domains (never Runtime.enable).
+    """
+    try:
+        for x, y in ((180, 220), (260, 275), (320, 310)):
+            await cdp.call(
+                "Input.dispatchMouseEvent",
+                {"type": "mouseMoved", "x": x, "y": y, "button": "none"},
+                timeout=2.0,
+            )
+            await asyncio.sleep(0.06)
+
+        flat = await cdp.call("DOM.getFlattenedDocument", {"depth": -1, "pierce": True}, timeout=3.0)
+        nodes = flat.get("nodes") or []
+        for node in nodes:
+            if not isinstance(node, dict) or str(node.get("nodeName") or "").upper() != "IFRAME":
+                continue
+            attrs = node.get("attributes") or []
+            attr_map = {
+                str(attrs[i]).lower(): str(attrs[i + 1])
+                for i in range(0, len(attrs) - 1, 2)
+            }
+            src = attr_map.get("src", "").lower()
+            title = attr_map.get("title", "").lower()
+            if (
+                "challenges.cloudflare.com" in src
+                or "turnstile" in src
+                or "cloudflare security challenge" in title
+            ):
+                node_id = node.get("nodeId")
+                if not node_id:
+                    continue
+                box = await cdp.call("DOM.getBoxModel", {"nodeId": node_id}, timeout=2.0)
+                content_quad = (box.get("model") or {}).get("content")
+                if isinstance(content_quad, list) and len(content_quad) >= 8:
+                    left_x = float(content_quad[0])
+                    top_y = float(content_quad[1])
+                    bottom_y = float(content_quad[5])
+                    height = max(20.0, bottom_y - top_y)
+                    click_x = int(left_x + 28)
+                    click_y = int(top_y + height / 2.0)
+                    await cdp.call(
+                        "Input.dispatchMouseEvent",
+                        {"type": "mouseMoved", "x": click_x, "y": click_y, "button": "none"},
+                        timeout=2.0,
+                    )
+                    await asyncio.sleep(0.08)
+                    await cdp.call(
+                        "Input.dispatchMouseEvent",
+                        {
+                            "type": "mousePressed",
+                            "x": click_x,
+                            "y": click_y,
+                            "button": "left",
+                            "clickCount": 1,
+                        },
+                        timeout=2.0,
+                    )
+                    await asyncio.sleep(0.05)
+                    await cdp.call(
+                        "Input.dispatchMouseEvent",
+                        {
+                            "type": "mouseReleased",
+                            "x": click_x,
+                            "y": click_y,
+                            "button": "left",
+                            "clickCount": 1,
+                        },
+                        timeout=2.0,
+                    )
+                    break
+    except Exception:
+        return
+
+
+async def _run_single_browser_attempt(
+    browser_bin: str,
+    url: str,
+    *,
+    headless: bool,
+    proxy_url: Optional[str],
+    verify_ssl: bool,
+    custom_cookie: str,
+    timeout_sec: float,
+) -> Optional[Dict[str, Any]]:
+    debug_port = _pick_ephemeral_port()
+    profile_dir = tempfile.mkdtemp(prefix="wcc_cdp_")
+    proc: Optional[subprocess.Popen[bytes]] = None
+    chromium_proxy = _normalize_chromium_proxy(proxy_url)
+
+    cmd: List[str] = [browser_bin]
+    if headless:
+        cmd.extend(["--headless=new", "--window-size=1366,768"])
+    else:
+        # Off-screen + minimized so Turnstile gets genuine compositor/GPU signals without disturbing the user
+        cmd.extend(
+            [
+                "--window-position=-32000,-32000",
+                "--window-size=1280,800",
+                "--start-minimized",
+            ]
+        )
+
+    cmd.extend(
+        [
+            f"--remote-debugging-port={debug_port}",
+            "--remote-allow-origins=*",
+            f"--user-data-dir={profile_dir}",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-blink-features=AutomationControlled",
+            "--disable-extensions",
+            "--disable-background-networking",
+            "--disable-sync",
+            "--mute-audio",
+            "--lang=en-US",
+        ]
+    )
+    if not verify_ssl:
+        cmd.append("--ignore-certificate-errors")
+    if chromium_proxy:
+        cmd.extend([f"--proxy-server={chromium_proxy}", "--disable-quic"])
+    if os.name != "nt":
+        cmd.extend(["--no-sandbox", "--disable-dev-shm-usage"])
+    cmd.append("about:blank")
+
+    popen_kwargs: Dict[str, Any] = {
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+    }
+    if os.name == "nt":
+        if headless:
+            popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+        else:
+            startupinfo = subprocess.STARTUPINFO()  # type: ignore[attr-defined]
+            startupinfo.dwFlags |= getattr(subprocess, "STARTF_USESHOWWINDOW", 1)
+            # SW_SHOWMINNOACTIVE = 7 (minimized without stealing focus)
+            startupinfo.wShowWindow = 7
+            popen_kwargs["startupinfo"] = startupinfo
+
+    try:
+        proc = subprocess.Popen(cmd, **popen_kwargs)
+
+        ws_url: Optional[str] = None
+        raw_ua = ""
+        deadline = time.monotonic() + 7.5
+        while time.monotonic() < deadline:
+            ver_info = await asyncio.to_thread(_http_get_local_json, debug_port, "/json/version")
+            if isinstance(ver_info, dict):
+                raw_ua = str(ver_info.get("User-Agent") or "")
+                tabs = await asyncio.to_thread(_http_get_local_json, debug_port, "/json/list")
+                if isinstance(tabs, list):
+                    for tab in tabs:
+                        if isinstance(tab, dict) and tab.get("type") == "page" and tab.get("webSocketDebuggerUrl"):
+                            ws_url = str(tab["webSocketDebuggerUrl"])
+                            break
+            if ws_url:
+                break
+            await asyncio.sleep(0.15)
+
+        if not ws_url:
+            return None
+
+        ua_override = _build_ua_override_params(raw_ua, browser_bin)
+        clean_ua = str(ua_override["userAgent"])
+
+        async with ws_connect(ws_url, max_size=32 * 1024 * 1024) as ws:
+            cdp = _RawCdpClient(ws)
+            try:
+                await cdp.call("Network.enable")
+                await cdp.call("Page.enable")
+                await cdp.call("DOM.enable")
+                await cdp.call("Network.setUserAgentOverride", ua_override)
+                await cdp.call(
+                    "Page.addScriptToEvaluateOnNewDocument",
+                    {"source": STEALTH_INIT_SCRIPT},
+                )
+
+                if custom_cookie:
+                    parsed_target = urlparse(url)
+                    domain_host = parsed_target.hostname or ""
+                    for pair in custom_cookie.split(";"):
+                        if "=" in pair and domain_host:
+                            k, v = pair.split("=", 1)
+                            try:
+                                await cdp.call(
+                                    "Network.setCookie",
+                                    {
+                                        "name": k.strip(),
+                                        "value": v.strip(),
+                                        "domain": domain_host,
+                                        "path": "/",
+                                    },
+                                )
+                            except Exception:
+                                pass
+
+                await cdp.call("Page.navigate", {"url": url})
+                try:
+                    await asyncio.wait_for(cdp.load_fired.wait(), timeout=min(15.0, timeout_sec))
+                except asyncio.TimeoutError:
+                    pass
+
+                await asyncio.sleep(0.9)
+                html = await cdp.get_outer_html()
+
+                nudged = False
+                wait_deadline = time.monotonic() + min(18.0, max(9.0, timeout_sec - 4.0))
+                poll_idx = 0
+                while time.monotonic() < wait_deadline and (
+                    cdp.doc_status in (403, 429, 503) or _looks_like_js_challenge(html)
+                ):
+                    poll_idx += 1
+                    if poll_idx in (2, 6) or not nudged:
+                        nudged = True
+                        await _nudge_turnstile_if_present(cdp)
+                    await asyncio.sleep(1.0)
+                    html = await cdp.get_outer_html()
+                    if cdp.doc_status == 200 and html and not _looks_like_js_challenge(html):
+                        break
+
+                raw_body = await cdp.get_raw_response_body()
+                ctype = cdp.doc_headers.get("content-type", "").lower()
+                if raw_body and (
+                    any(t in ctype for t in ("xml", "json", "rss", "atom"))
+                    or raw_body.lstrip().startswith(("<?xml", "<rss", "<feed", "{", "["))
+                ):
+                    final_text = raw_body
+                else:
+                    final_text = html or raw_body or ""
+
+                is_solved = cdp.doc_status < 400 and bool(final_text) and not _looks_like_js_challenge(final_text)
+
+                if is_solved:
+                    cookies_res = await cdp.call("Network.getAllCookies")
+                    cookies_list = cookies_res.get("cookies") or []
+                    target_base = DomainClearanceCache._base_domain(cdp.doc_url or url)
+                    relevant_pairs = [
+                        f"{c['name']}={c['value']}"
+                        for c in cookies_list
+                        if isinstance(c, dict)
+                        and c.get("name")
+                        and target_base
+                        and target_base in str(c.get("domain") or "").lower().lstrip(".")
+                    ]
+                    if relevant_pairs:
+                        CLEARANCE_CACHE.put(
+                            cdp.doc_url or url,
+                            proxy_url,
+                            cookie_header="; ".join(relevant_pairs),
+                            user_agent=clean_ua,
+                        )
+
+                return {
+                    "url": cdp.doc_url or url,
+                    "status_code": cdp.doc_status,
+                    "text": final_text,
+                    "headers": cdp.doc_headers,
+                    "via": "browser_cdp" if headless else "browser_cdp_gui",
+                    "solved": is_solved,
+                }
+            finally:
+                await cdp.close()
+    except Exception:
+        return None
+    finally:
+        if proc is not None:
+            try:
+                proc.kill()
+                proc.wait(timeout=4)
+            except Exception:
+                pass
+        shutil.rmtree(profile_dir, ignore_errors=True)
+
+
 async def fetch_via_local_browser(
     url: str,
     *,
@@ -296,9 +729,12 @@ async def fetch_via_local_browser(
     timeout_sec: float = 25.0,
 ) -> Optional[Dict[str, Any]]:
     """
-    Launches a local Chromium/Edge/Chrome browser in `--headless=new` mode to pass
-    Cloudflare JS Managed Challenges and returns `{url, status_code, text, headers}`.
-    Returns None if no local browser is available or if proxy uses inline credentials.
+    Solves Cloudflare JS Managed Challenges & Turnstile using the locally installed
+    Chrome/Edge/Brave browser:
+      - Pass 1: Invisible `--headless=new` with full Client Hints (`userAgentMetadata`) + GPU.
+      - Pass 2: If Turnstile still loops in headless mode and a desktop session is available
+                (Windows/macOS/GUI Linux), retries in an off-screen minimized window without
+                stealing focus and caches `cf_clearance` for 25 minutes.
     """
     if not HAS_WEBSOCKETS or ws_connect is None:
         return None
@@ -311,173 +747,45 @@ async def fetch_via_local_browser(
     if not browser_bin:
         return None
 
+    target_domain = DomainClearanceCache._base_domain(url)
+    can_gui = _can_use_gui_fallback()
+    skip_headless = bool(can_gui and target_domain and target_domain in _GUI_REQUIRED_DOMAINS)
+
     async with _BROWSER_SEMAPHORE:
-        debug_port = _pick_ephemeral_port()
-        profile_dir = tempfile.mkdtemp(prefix="wcc_cdp_")
-        proc: Optional[subprocess.Popen[bytes]] = None
-
-        cmd: List[str] = [
-            browser_bin,
-            "--headless=new",
-            f"--remote-debugging-port={debug_port}",
-            "--remote-allow-origins=*",
-            f"--user-data-dir={profile_dir}",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--disable-blink-features=AutomationControlled",
-            "--disable-extensions",
-            "--disable-background-networking",
-            "--disable-sync",
-            "--disable-gpu",
-            "--mute-audio",
-            "--window-size=1366,768",
-            "--lang=en-US",
-        ]
-        if not verify_ssl:
-            cmd.append("--ignore-certificate-errors")
-        if proxy_url:
-            cmd.append(f"--proxy-server={proxy_url}")
-        if os.name != "nt":
-            cmd.extend(["--no-sandbox", "--disable-dev-shm-usage"])
-        cmd.append("about:blank")
-
-        popen_kwargs: Dict[str, Any] = {
-            "stdout": subprocess.DEVNULL,
-            "stderr": subprocess.DEVNULL,
-        }
-        if os.name == "nt":
-            popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
-
-        try:
-            proc = subprocess.Popen(cmd, **popen_kwargs)
-
-            # Wait for DevTools HTTP endpoint
-            ws_url: Optional[str] = None
-            raw_ua = ""
-            deadline = time.monotonic() + 7.0
-            while time.monotonic() < deadline:
-                ver_info = await asyncio.to_thread(_http_get_local_json, debug_port, "/json/version")
-                if isinstance(ver_info, dict):
-                    raw_ua = str(ver_info.get("User-Agent") or "")
-                    tabs = await asyncio.to_thread(_http_get_local_json, debug_port, "/json/list")
-                    if isinstance(tabs, list):
-                        for tab in tabs:
-                            if isinstance(tab, dict) and tab.get("type") == "page" and tab.get("webSocketDebuggerUrl"):
-                                ws_url = str(tab["webSocketDebuggerUrl"])
-                                break
-                if ws_url:
-                    break
-                await asyncio.sleep(0.15)
-
-            if not ws_url:
-                return None
-
-            clean_ua = raw_ua.replace("HeadlessChrome/", "Chrome/") or (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+        res_headless: Optional[Dict[str, Any]] = None
+        if not skip_headless:
+            res_headless = await _run_single_browser_attempt(
+                browser_bin,
+                url,
+                headless=True,
+                proxy_url=proxy_url,
+                verify_ssl=verify_ssl,
+                custom_cookie=custom_cookie,
+                timeout_sec=timeout_sec,
             )
+            if res_headless and res_headless.get("solved"):
+                return res_headless
 
-            async with ws_connect(ws_url, max_size=32 * 1024 * 1024) as ws:
-                cdp = _RawCdpClient(ws)
-                try:
-                    await cdp.call("Network.enable")
-                    await cdp.call("Page.enable")
-                    await cdp.call("DOM.enable")
-                    await cdp.call(
-                        "Network.setUserAgentOverride",
-                        {
-                            "userAgent": clean_ua,
-                            "acceptLanguage": "en-US,en;q=0.9,fa-IR;q=0.8",
-                            "platform": "Win32" if os.name == "nt" else "Linux x86_64",
-                        },
-                    )
+            # Do not escalate to Pass 2 for non-challenge errors like 404 or 522
+            if res_headless and not (
+                int(res_headless.get("status_code") or 0) in (401, 403, 429, 503)
+                or _looks_like_js_challenge(str(res_headless.get("text") or ""))
+            ):
+                return res_headless
 
-                    # Inject any user-configured cookies onto target domain before navigating
-                    if custom_cookie:
-                        parsed_target = urlparse(url)
-                        domain_host = parsed_target.hostname or ""
-                        for pair in custom_cookie.split(";"):
-                            if "=" in pair and domain_host:
-                                k, v = pair.split("=", 1)
-                                try:
-                                    await cdp.call(
-                                        "Network.setCookie",
-                                        {
-                                            "name": k.strip(),
-                                            "value": v.strip(),
-                                            "domain": domain_host,
-                                            "path": "/",
-                                        },
-                                    )
-                                except Exception:
-                                    pass
+        if can_gui:
+            res_gui = await _run_single_browser_attempt(
+                browser_bin,
+                url,
+                headless=False,
+                proxy_url=proxy_url,
+                verify_ssl=verify_ssl,
+                custom_cookie=custom_cookie,
+                timeout_sec=max(22.0, timeout_sec),
+            )
+            if res_gui is not None:
+                if res_gui.get("solved") and target_domain:
+                    _GUI_REQUIRED_DOMAINS.add(target_domain)
+                return res_gui
 
-                    await cdp.call("Page.navigate", {"url": url})
-                    try:
-                        await asyncio.wait_for(cdp.load_fired.wait(), timeout=min(15.0, timeout_sec))
-                    except asyncio.TimeoutError:
-                        pass
-
-                    # Give initial scripts a brief beat, then poll if Cloudflare JS challenge is active
-                    await asyncio.sleep(0.8)
-                    html = await cdp.get_outer_html()
-
-                    wait_deadline = time.monotonic() + min(15.0, max(8.0, timeout_sec - 4.0))
-                    while time.monotonic() < wait_deadline and (
-                        cdp.doc_status in (403, 429, 503) or _looks_like_js_challenge(html)
-                    ):
-                        await asyncio.sleep(1.0)
-                        html = await cdp.get_outer_html()
-                        if cdp.doc_status == 200 and html and not _looks_like_js_challenge(html):
-                            break
-
-                    # Prefer raw network body for XML feeds / JSON APIs; fall back to rendered DOM for SPAs/HTML
-                    raw_body = await cdp.get_raw_response_body()
-                    ctype = cdp.doc_headers.get("content-type", "").lower()
-                    if raw_body and (
-                        any(t in ctype for t in ("xml", "json", "rss", "atom"))
-                        or raw_body.lstrip().startswith(("<?xml", "<rss", "<feed", "{", "["))
-                    ):
-                        final_text = raw_body
-                    else:
-                        final_text = html or raw_body or ""
-
-                    # Cache cookies (including cf_clearance) for fast subsequent requests
-                    cookies_res = await cdp.call("Network.getAllCookies")
-                    cookies_list = cookies_res.get("cookies") or []
-                    target_base = DomainClearanceCache._base_domain(cdp.doc_url or url)
-                    relevant_pairs = [
-                        f"{c['name']}={c['value']}"
-                        for c in cookies_list
-                        if isinstance(c, dict)
-                        and c.get("name")
-                        and target_base
-                        and target_base in str(c.get("domain") or "").lower().lstrip(".")
-                    ]
-                    if relevant_pairs and cdp.doc_status < 400 and not _looks_like_js_challenge(final_text):
-                        CLEARANCE_CACHE.put(
-                            cdp.doc_url or url,
-                            proxy_url,
-                            cookie_header="; ".join(relevant_pairs),
-                            user_agent=clean_ua,
-                        )
-
-                    return {
-                        "url": cdp.doc_url or url,
-                        "status_code": cdp.doc_status,
-                        "text": final_text,
-                        "headers": cdp.doc_headers,
-                        "via": "browser_cdp",
-                    }
-                finally:
-                    await cdp.close()
-        except Exception:
-            return None
-        finally:
-            if proc is not None:
-                try:
-                    proc.kill()
-                    proc.wait(timeout=4)
-                except Exception:
-                    pass
-            shutil.rmtree(profile_dir, ignore_errors=True)
+        return res_headless
