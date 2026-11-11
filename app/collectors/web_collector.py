@@ -5,6 +5,8 @@ import re
 from typing import Any, Dict, List, Optional
 from urllib.parse import urljoin, urlparse, urlunparse
 
+from bs4 import BeautifulSoup
+
 from app.collectors.base import (
     CollectorError,
     FetchBatchResult,
@@ -74,6 +76,92 @@ SSO_AUTH_PATH_RE = re.compile(
     r"(?:^|/)(?:oauth2?|openid-connect|saml2?|sso|login|signin|sign-in|wp-login\.php)(?:/|$)",
     re.IGNORECASE,
 )
+
+WSJ_SECTION_FEEDS: Dict[str, str] = {
+    "world": "https://feeds.content.dowjones.io/public/rss/RSSWorldNews",
+    "us-news": "https://feeds.content.dowjones.io/public/rss/RSSUSnews",
+    "politics": "https://feeds.content.dowjones.io/public/rss/socialpoliticsfeed",
+    "economy": "https://feeds.content.dowjones.io/public/rss/socialeconomyfeed",
+    "business": "https://feeds.content.dowjones.io/public/rss/WSJcomUSBusiness",
+    "markets": "https://feeds.content.dowjones.io/public/rss/RSSMarketsMain",
+    "finance": "https://feeds.content.dowjones.io/public/rss/RSSMarketsMain",
+    "tech": "https://feeds.content.dowjones.io/public/rss/RSSWSJD",
+    "opinion": "https://feeds.content.dowjones.io/public/rss/RSSOpinion",
+}
+
+SPARSE_HOMEPAGE_HUB_PRIORITY = (
+    "/articles",
+    "/news",
+    "/latest",
+    "/analysis",
+    "/reports",
+    "/publications",
+)
+
+
+def _resolve_known_public_feeds(url: str) -> List[str]:
+    """
+    Returns known official external RSS feeds for sites that host feeds on a separate CDN
+    behind DataDome/paywalls (e.g. `wsj.com` -> `feeds.content.dowjones.io`) or vanity domains
+    (`ipforum.org` -> `israelpolicyforum.org/feed/`).
+    """
+    parsed = urlparse(url or "")
+    reg_domain = extract_registrable_domain(parsed.hostname or "")
+    path_parts = [seg.lower() for seg in (parsed.path or "").split("/") if seg]
+
+    if reg_domain == "wsj.com":
+        if path_parts:
+            first_seg = path_parts[0]
+            if first_seg in WSJ_SECTION_FEEDS:
+                return [WSJ_SECTION_FEEDS[first_seg]]
+        # Root or general landing page -> official WSJ World + US News feeds
+        return [
+            "https://feeds.content.dowjones.io/public/rss/RSSWorldNews",
+            "https://feeds.content.dowjones.io/public/rss/RSSUSnews",
+        ]
+
+    if reg_domain == "ipforum.org" and not path_parts:
+        return ["https://israelpolicyforum.org/feed/"]
+
+    return []
+
+
+def _discover_section_hub_url(html: str, page_url: str) -> Optional[str]:
+    """
+    When a root homepage only displays a sparse hero/book promo (e.g. `en.idi.org.il/` with 2 cards)
+    while linking to a full `/articles/` or `/news/` listing on the same host, returns that hub URL.
+    """
+    if not html or not page_url:
+        return None
+    base_parsed = urlparse(page_url)
+    base_host = (base_parsed.hostname or "").lower().rstrip(".")
+    if not base_host:
+        return None
+
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+    except Exception:
+        return None
+
+    found_by_slug: Dict[str, str] = {}
+    for a_tag in soup.find_all("a", href=True):
+        raw_href = str(a_tag.get("href") or "").strip()
+        if not raw_href or raw_href.startswith(("#", "javascript:", "mailto:", "tel:")):
+            continue
+        resolved = urljoin(page_url, raw_href)
+        p = urlparse(resolved)
+        if p.scheme not in ("http", "https"):
+            continue
+        if (p.hostname or "").lower().rstrip(".") != base_host:
+            continue
+        norm_path = (p.path or "").rstrip("/").lower()
+        if norm_path in SPARSE_HOMEPAGE_HUB_PRIORITY and norm_path not in found_by_slug:
+            found_by_slug[norm_path] = urlunparse((p.scheme, p.netloc, p.path, "", "", ""))
+
+    for slug in SPARSE_HOMEPAGE_HUB_PRIORITY:
+        if slug in found_by_slug:
+            return found_by_slug[slug]
+    return None
 
 
 def _is_root_like_url(url: str) -> bool:
@@ -235,8 +323,10 @@ class WebSiteCollector:
         if resp.status_code != 200 or not resp.text:
             return None
 
+        effective_base = resp.url or base_url
+
         if is_feed_document(resp.text, resp.content_type):
-            title, posts = parse_feed_content(resp.text, base_url=base_url, tz_name=tz_name)
+            title, posts = parse_feed_content(resp.text, base_url=effective_base, tz_name=tz_name)
             if posts:
                 return FetchBatchResult(
                     site_title=title,
@@ -246,7 +336,7 @@ class WebSiteCollector:
                 )
 
         if is_wp_posts_json(resp.text, resp.content_type):
-            title, posts = parse_wp_posts_json(resp.text, base_url=base_url, tz_name=tz_name)
+            title, posts = parse_wp_posts_json(resp.text, base_url=effective_base, tz_name=tz_name)
             if posts:
                 return FetchBatchResult(
                     site_title=title,
@@ -255,6 +345,41 @@ class WebSiteCollector:
                     discovered_feed_url=resp.url,
                 )
 
+        return None
+
+    async def _try_sparse_homepage_hub_upgrade(
+        self,
+        fetcher: SmartHttpFetcher,
+        html: str,
+        page_url: str,
+        tz_name: str,
+        *,
+        existing_posts: List[FetchedPost],
+        existing_title: str = "",
+    ) -> Optional[FetchBatchResult]:
+        if not _is_root_like_url(page_url) or len(existing_posts) >= 4:
+            return None
+
+        hub_url = _discover_section_hub_url(html, page_url)
+        if not hub_url:
+            return None
+
+        try:
+            hub_resp = await self._get_with_https_upgrade(fetcher, hub_url, referer=page_url)
+            if hub_resp.status_code != 200 or _is_sso_login_wall(hub_resp, hub_url):
+                return None
+            hub_title, hub_posts = extract_listing_posts(
+                hub_resp.text, page_url=hub_resp.url or hub_url, tz_name=tz_name
+            )
+            if len(hub_posts) > len(existing_posts):
+                return FetchBatchResult(
+                    site_title=existing_title or hub_title,
+                    posts=hub_posts,
+                    source_mode="html",
+                    discovered_feed_url=None,
+                )
+        except CollectorError:
+            return None
         return None
 
     async def _probe_candidate_endpoints(
@@ -408,6 +533,16 @@ class WebSiteCollector:
             if root_resp.status_code == 200 and not _is_sso_login_wall(root_resp, origin):
                 resp = root_resp
 
+        if resp.status_code in (401, 403, 429, 503):
+            public_feeds = _resolve_known_public_feeds(canonical_url)
+            if public_feeds:
+                fast_probe = SmartHttpFetcher(fetcher.settings, allow_browser_fallback=False)
+                rescued_feed = await self._probe_candidate_endpoints(
+                    fast_probe, public_feeds, base_url=canonical_url, tz_name=tz_name
+                )
+                if rescued_feed is not None:
+                    return rescued_feed
+
         resp.raise_for_status()
 
         direct = await self._try_parse_feed_or_wp_response(
@@ -416,7 +551,22 @@ class WebSiteCollector:
         if direct is not None:
             return direct
 
-        title, posts = extract_listing_posts(resp.text, page_url=resp.url, tz_name=tz_name)
+        try:
+            title, posts = extract_listing_posts(resp.text, page_url=resp.url, tz_name=tz_name)
+        except CollectorError:
+            upgraded_empty = await self._try_sparse_homepage_hub_upgrade(
+                fetcher, resp.text, resp.url, tz_name, existing_posts=[]
+            )
+            if upgraded_empty is not None:
+                return upgraded_empty
+            raise
+
+        upgraded = await self._try_sparse_homepage_hub_upgrade(
+            fetcher, resp.text, resp.url, tz_name, existing_posts=posts, existing_title=title
+        )
+        if upgraded is not None:
+            return upgraded
+
         return FetchBatchResult(
             site_title=title,
             posts=posts,
@@ -437,6 +587,15 @@ class WebSiteCollector:
             )
             if res is not None:
                 return res
+
+        public_feeds = _resolve_known_public_feeds(canonical_url)
+        if public_feeds:
+            fast_probe = SmartHttpFetcher(fetcher.settings, allow_browser_fallback=False)
+            pub_res = await self._probe_candidate_endpoints(
+                fast_probe, public_feeds, base_url=canonical_url, tz_name=tz_name
+            )
+            if pub_res is not None:
+                return pub_res
 
         resp = await self._get_with_https_upgrade(fetcher, canonical_url)
         if _is_sso_login_wall(resp, canonical_url):
@@ -503,6 +662,16 @@ class WebSiteCollector:
                 return direct
             if (looks_like_feed_url(canonical_url) or "/wp-json/" in canonical_url) and not known_feed_url:
                 resp.raise_for_status()
+
+        # 1b. Known official external feeds (e.g. wsj.com -> feeds.content.dowjones.io, ipforum.org -> israelpolicyforum.org)
+        public_feeds = _resolve_known_public_feeds(canonical_url)
+        if public_feeds:
+            fast_probe = SmartHttpFetcher(fetcher.settings, allow_browser_fallback=False)
+            pub_res = await self._probe_candidate_endpoints(
+                fast_probe, public_feeds, base_url=canonical_url, tz_name=tz_name
+            )
+            if pub_res is not None:
+                return pub_res
 
         # 2. Fetch the main target URL (preferring https:// for plain http:// public URLs)
         resp = await self._get_with_https_upgrade(fetcher, canonical_url)
@@ -600,9 +769,14 @@ class WebSiteCollector:
             if found is not None:
                 return found
 
-        # 6. Scrape HTML listing directly (handles custom portals like iiss.org, lawfaremedia.org, criticalthreats.org)
+        # 6. Scrape HTML listing directly (handles custom portals like iiss.org, lawfaremedia.org, criticalthreats.org, en.idi.org.il)
         try:
             title, posts = extract_listing_posts(resp.text, page_url=final_url, tz_name=tz_name)
+            upgraded = await self._try_sparse_homepage_hub_upgrade(
+                fetcher, resp.text, final_url, tz_name, existing_posts=posts, existing_title=title
+            )
+            if upgraded is not None:
+                return upgraded
             return FetchBatchResult(
                 site_title=title,
                 posts=posts,
@@ -610,7 +784,7 @@ class WebSiteCollector:
                 discovered_feed_url=None,
             )
         except CollectorError:
-            # 7. Last-resort fallback for JS/SPA homepages: probe common feeds + WP REST API + sitemaps
+            # 7. Last-resort fallback for JS/SPA or promo-only homepages: probe common feeds + WP REST API + section hubs + sitemaps
             fast_probe_fetcher = SmartHttpFetcher(fetcher.settings, allow_browser_fallback=False)
             rescued = await self._probe_candidate_endpoints(
                 fast_probe_fetcher,
@@ -621,6 +795,11 @@ class WebSiteCollector:
             if rescued is not None:
                 return rescued
             if is_root:
+                upgraded_empty = await self._try_sparse_homepage_hub_upgrade(
+                    fetcher, resp.text, final_url, tz_name, existing_posts=[]
+                )
+                if upgraded_empty is not None:
+                    return upgraded_empty
                 sm_rescued = await self._probe_sitemap_rescue(fetcher.settings, final_url, tz_name)
                 if sm_rescued is not None:
                     return sm_rescued

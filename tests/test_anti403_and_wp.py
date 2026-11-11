@@ -604,3 +604,392 @@ async def test_dead_404_subpath_rescues_from_root_and_sso_redirect_rescues_publi
     assert len(mc_batch.posts) == 2
     assert mc_batch.posts[0].title == "U.S. Consumer Spending Tracker"
 
+
+IDI_SPARSE_HOMEPAGE_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head><title>The Israel Democracy Institute</title></head>
+<body>
+    <nav class="main-menu">
+        <a href="/articles">Articles</a>
+        <a href="/books">Books</a>
+    </nav>
+    <main>
+        <a href="/tags-en/4512">Judicial Reform Tag</a>
+        <a href="/media/25981/annual-democracy-index.pdf">Free Download</a>
+        <article class="card">
+            <a href="https://en.idi.org.il/articles/67075">
+                <img src="https://en.idi.org.il/media/67075.jpg" alt="A Snapshot of Israel's New Knesset" />
+            </a>
+            <span>November 10, 2026</span>
+            <p>An updated breakdown of legislative activity and committee leadership in the winter session.</p>
+        </article>
+    </main>
+</body>
+</html>
+"""
+
+IDI_ARTICLES_HUB_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head><title>Articles - The Israel Democracy Institute</title></head>
+<body>
+    <main>
+        <div class="card">
+            <a href="https://en.idi.org.il/articles/67075">
+                <img src="/media/67075.jpg" alt="A Snapshot of Israel's New Knesset" />
+            </a>
+            <span>November 10, 2026</span>
+            <p>An updated breakdown of legislative activity and committee leadership in the winter session.</p>
+        </div>
+        <div class="card">
+            <a href="https://en.idi.org.il/articles/67071">
+                <img src="/media/67071.jpg" alt="Local Authorities Under Wartime Budget Strain" />
+            </a>
+            <span>November 8, 2026</span>
+            <p>Municipal budgets face acute deficits across northern and southern districts.</p>
+        </div>
+        <div class="card">
+            <a href="https://en.idi.org.il/articles/67068" title="Constitutional Oversight Standards in Comparative Perspective">
+                <img src="/media/default.png" alt="image" />
+            </a>
+            <span>November 6, 2026</span>
+            <p>Comparative review of judicial review thresholds in parliamentary democracies.</p>
+        </div>
+    </main>
+</body>
+</html>
+"""
+
+MEMRI_CAROUSEL_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head><title>MEMRI | Middle East Media Research Institute</title></head>
+<body>
+    <div class="breaking-ticker">
+        <div class="card">
+            <a href="/reports/irans-missile-program-enters-new-phase">
+                Iran's Missile Program Enters A New...
+            </a>
+        </div>
+    </div>
+    <div class="slick-slider">
+        <div class="slick-cloned card">
+            <h3><a href="/reports/cloned-old-slide-should-be-ignored">Cloned Slide Should Be Ignored</a></h3>
+            <span>September 01, 2026</span>
+        </div>
+        <div class="card">
+            <h3><a href="/reports/older-featured-carousel-report-nov2">Featured Analysis From Early November</a></h3>
+            <span>November 02, 2026</span>
+        </div>
+        <div class="card">
+            <h3><a href="/reports/older-featured-carousel-report-oct30">Featured Regional Briefing Late October</a></h3>
+            <span>October 30, 2026</span>
+        </div>
+    </div>
+    <section class="latest-grid">
+        <article class="card">
+            <img src="https://www.memri.org/sites/default/files/missile.jpg" />
+            <h3>
+                <a href="/reports/irans-missile-program-enters-new-phase">
+                    Iran's Missile Program Enters A New Phase After Recent Exercises
+                </a>
+            </h3>
+            <span>November 10, 2026</span>
+            <p>Detailed assessment of newly unveiled solid-fuel launchers and command telemetry.</p>
+        </article>
+        <article class="card">
+            <h3>
+                <a href="/reports/red-sea-maritime-security-nov9">
+                    Red Sea Maritime Security Escort Operations Expand
+                </a>
+            </h3>
+            <span>November 09, 2026</span>
+            <p>Coalition naval task forces report increased commercial transit escorts.</p>
+        </article>
+    </section>
+</body>
+</html>
+"""
+
+AFCENT_MIL_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head><title>Air Forces Central &gt; News</title></head>
+<body>
+    <main>
+        <div class="alist-item card">
+            <h1>
+                <a href="/News/Article-Display/Article/4021234/us-air-forces-central-conducts-readiness-exercise/">
+                    U.S. Air Forces Central conducts coalition readiness exercise
+                </a>
+            </h1>
+            <span>Nov. 4, 2026</span>
+            <p>Coalition aircrews integrated across multiple command centers during the multi-day exercise.</p>
+        </div>
+        <div class="alist-item card">
+            <h1>
+                <a href="/News/Article-Display/Article/4019800/expeditionary-wing-completes-airlift-surge/">
+                    Expeditionary wing completes theater airlift surge
+                </a>
+            </h1>
+            <span>Sept. 10, 2026</span>
+            <p>Logistics squadrons moved over 400 pallets of humanitarian and operational cargo.</p>
+        </div>
+    </main>
+</body>
+</html>
+"""
+
+
+async def test_idi_image_only_cards_and_sparse_homepage_hub_upgrade(monkeypatch):
+    # 1. Direct extraction on /articles/ handles image-alt & a[title] cards with empty anchor text
+    title, posts = extract_listing_posts(
+        IDI_ARTICLES_HUB_HTML, page_url="https://en.idi.org.il/articles/", tz_name="UTC"
+    )
+    assert len(posts) == 3
+    assert posts[0].title == "A Snapshot of Israel's New Knesset"
+    assert posts[0].media_url == "https://en.idi.org.il/media/67075.jpg"
+    assert posts[1].title == "Local Authorities Under Wartime Budget Strain"
+    assert posts[2].title == "Constitutional Oversight Standards in Comparative Perspective"
+
+    # 2. Root homepage `en.idi.org.il/` skips /tags-en/ and .pdf, and upgrades from 1 sparse card -> 3 cards on `/articles`
+    async def _mock_get(self, url, **kwargs):
+        if url.rstrip("/") == "https://en.idi.org.il":
+            return HttpFetchResponse(
+                url="https://en.idi.org.il/",
+                status_code=200,
+                text=IDI_SPARSE_HOMEPAGE_HTML,
+                headers={"content-type": "text/html; charset=utf-8"},
+            )
+        if url.rstrip("/") == "https://en.idi.org.il/articles":
+            return HttpFetchResponse(
+                url="https://en.idi.org.il/articles/",
+                status_code=200,
+                text=IDI_ARTICLES_HUB_HTML,
+                headers={"content-type": "text/html; charset=utf-8"},
+            )
+        return HttpFetchResponse(url=url, status_code=404, text="not found", headers={})
+
+    monkeypatch.setattr(SmartHttpFetcher, "get", _mock_get)
+    collector = WebSiteCollector()
+    batch = await collector.fetch_site_posts(
+        site={"canonical_url": "https://en.idi.org.il/"},
+        settings=dict(DEFAULT_SETTINGS),
+    )
+    assert batch.source_mode == "html"
+    assert len(batch.posts) == 3
+    assert batch.posts[0].title == "A Snapshot of Israel's New Knesset"
+
+
+def test_memri_carousel_clones_truncated_ticker_enrichment_and_date_sorting():
+    site_title, posts = extract_listing_posts(
+        MEMRI_CAROUSEL_HTML, page_url="https://www.memri.org/", tz_name="UTC"
+    )
+    assert site_title == "MEMRI"
+    urls = [p.post_url for p in posts]
+    # .slick-cloned slide is completely excluded
+    assert all("cloned-old-slide" not in u for u in urls)
+    assert len(posts) == 4
+
+    # Out-of-order carousel dates (Nov 02 / Oct 30 before Nov 10) are sorted newest-first!
+    assert [p.published_at for p in posts] == [
+        datetime(2026, 11, 10, 0, 0, tzinfo=timezone.utc),
+        datetime(2026, 11, 9, 0, 0, tzinfo=timezone.utc),
+        datetime(2026, 11, 2, 0, 0, tzinfo=timezone.utc),
+        datetime(2026, 10, 30, 0, 0, tzinfo=timezone.utc),
+    ]
+    # Truncated top-ticker title ("Iran's Missile Program Enters A New...") was upgraded from full card!
+    assert posts[0].title == "Iran's Missile Program Enters A New Phase After Recent Exercises"
+    assert posts[0].media_url == "https://www.memri.org/sites/default/files/missile.jpg"
+
+
+async def test_wsj_public_dowjones_feeds_and_ipforum_cross_domain_redirect(monkeypatch):
+    from app.collectors.web_collector import _resolve_known_public_feeds
+
+    assert "https://feeds.content.dowjones.io/public/rss/RSSWorldNews" in _resolve_known_public_feeds(
+        "https://www.wsj.com/"
+    )
+    assert _resolve_known_public_feeds("https://www.wsj.com/markets") == [
+        "https://feeds.content.dowjones.io/public/rss/RSSMarketsMain"
+    ]
+    assert _resolve_known_public_feeds("https://www.ipforum.org/") == [
+        "https://israelpolicyforum.org/feed/"
+    ]
+
+    wsj_rss = """<?xml version="1.0" encoding="UTF-8"?>
+    <rss version="2.0"><channel><title>WSJ.com: World News</title>
+        <item>
+            <title>Global Central Banks Weigh Late-Year Rate Moves</title>
+            <link>https://www.wsj.com/articles/global-central-banks-weigh-rate-moves-12345</link>
+            <pubDate>Tue, 10 Nov 2026 11:00:00 GMT</pubDate>
+            <description>Policymakers signal caution ahead of December meetings.</description>
+        </item>
+    </channel></rss>"""
+
+    ipf_rss = """<?xml version="1.0" encoding="UTF-8"?>
+    <rss version="2.0"><channel><title>Israel Policy Forum</title>
+        <item>
+            <title>Regional Diplomacy Assessment</title>
+            <link>/2026/11/regional-diplomacy-assessment/</link>
+            <pubDate>Tue, 10 Nov 2026 09:00:00 +0000</pubDate>
+            <description>Policy analysis of diplomatic frameworks.</description>
+        </item>
+    </channel></rss>"""
+
+    async def _mock_get(self, url, **kwargs):
+        if "feeds.content.dowjones.io" in url:
+            return HttpFetchResponse(
+                url=url,
+                status_code=200,
+                text=wsj_rss,
+                headers={"content-type": "application/rss+xml"},
+            )
+        if "wsj.com" in url:
+            return HttpFetchResponse(
+                url=url,
+                status_code=403,
+                text="<html><script src='https://geo.captcha-delivery.com/captcha.js'></script></html>",
+                headers={"content-type": "text/html"},
+            )
+        if "israelpolicyforum.org/feed" in url:
+            return HttpFetchResponse(
+                url="https://israelpolicyforum.org/feed/",
+                status_code=200,
+                text=ipf_rss,
+                headers={"content-type": "application/rss+xml"},
+            )
+        return HttpFetchResponse(url=url, status_code=404, text="not found", headers={})
+
+    monkeypatch.setattr(SmartHttpFetcher, "get", _mock_get)
+    collector = WebSiteCollector()
+
+    wsj_batch = await collector.fetch_site_posts(
+        site={"canonical_url": "https://www.wsj.com/"},
+        settings=dict(DEFAULT_SETTINGS),
+    )
+    assert wsj_batch.source_mode == "rss"
+    assert len(wsj_batch.posts) == 1
+    assert wsj_batch.posts[0].title == "Global Central Banks Weigh Late-Year Rate Moves"
+
+    ipf_batch = await collector.fetch_site_posts(
+        site={"canonical_url": "https://www.ipforum.org/"},
+        settings=dict(DEFAULT_SETTINGS),
+    )
+    assert ipf_batch.source_mode == "rss"
+    assert ipf_batch.posts[0].post_url == "https://israelpolicyforum.org/2026/11/regional-diplomacy-assessment"
+
+
+async def test_dod_mil_ssl_cert_auto_recovery_and_afcent_scraping(monkeypatch):
+    import httpx
+    from app.collectors.http_fetcher import _is_ssl_cert_error
+
+    ssl_exc = httpx.ConnectError("[SSL: CERTIFICATE_VERIFY_FAILED] unable to get local issuer certificate")
+    assert _is_ssl_cert_error(ssl_exc) is True
+
+    verify_calls = []
+
+    async def _fake_httpx_fetch(
+        self, url, *, proxy_url, accept_kind, referer, timeout_sec, verify_override=None
+    ):
+        effective_verify = self.verify_ssl if verify_override is None else verify_override
+        verify_calls.append(effective_verify)
+        if effective_verify:
+            raise ssl_exc
+        return HttpFetchResponse(
+            url="https://www.afcent.af.mil/News",
+            status_code=200,
+            text=AFCENT_MIL_HTML,
+            headers={"content-type": "text/html; charset=utf-8"},
+            via="httpx",
+        )
+
+    monkeypatch.setattr(SmartHttpFetcher, "_fetch_httpx", _fake_httpx_fetch)
+    collector = WebSiteCollector()
+    batch = await collector.fetch_site_posts(
+        site={"canonical_url": "https://www.afcent.af.mil/News"},
+        settings={**DEFAULT_SETTINGS, "verify_ssl": "1", "timezone": "UTC"},
+    )
+    assert verify_calls[0] is True
+    assert False in verify_calls
+    assert batch.source_mode == "html"
+    assert len(batch.posts) == 2
+    assert batch.posts[0].title == "U.S. Air Forces Central conducts coalition readiness exercise"
+    assert batch.posts[0].published_at == datetime(2026, 11, 4, 0, 0, tzinfo=timezone.utc)
+    assert batch.posts[1].published_at == datetime(2026, 9, 10, 0, 0, tzinfo=timezone.utc)
+
+
+async def test_turnstile_oopif_auto_attach_and_persistent_profile():
+    import asyncio
+    import json
+    from app.collectors.browser_fetcher import _RawCdpClient, _get_persistent_profile_dir
+
+    sent_frames = []
+
+    class _DummyWs:
+        def __init__(self):
+            self._events = [
+                json.dumps(
+                    {
+                        "method": "Target.attachedToTarget",
+                        "params": {
+                            "sessionId": "oopif-turnstile-1",
+                            "targetInfo": {
+                                "type": "iframe",
+                                "url": "https://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/g/turnstile",
+                            },
+                            "waitingForDebugger": True,
+                        },
+                    }
+                )
+            ]
+
+        async def send(self, payload: str):
+            msg = json.loads(payload)
+            sent_frames.append(msg)
+            # Auto-reply to any CDP command so _configure_child_target completes immediately
+            self._events.append(
+                json.dumps(
+                    {
+                        "id": msg["id"],
+                        "sessionId": msg.get("sessionId"),
+                        "result": {},
+                    }
+                )
+            )
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            for _ in range(20):
+                if self._events:
+                    return self._events.pop(0)
+                await asyncio.sleep(0.01)
+            raise StopAsyncIteration
+
+        async def close(self):
+            return None
+
+    ua_override = _build_ua_override_params("Mozilla/5.0 HeadlessChrome/131.0.6778.86 Safari/537.36")
+    client = _RawCdpClient(_DummyWs(), ua_override=ua_override)
+    await asyncio.sleep(0.08)
+    await client.close()
+
+    oopif_methods = [f["method"] for f in sent_frames if f.get("sessionId") == "oopif-turnstile-1"]
+    assert "Emulation.setUserAgentOverride" in oopif_methods
+    assert "Page.addScriptToEvaluateOnNewDocument" in oopif_methods
+    assert "Runtime.runIfWaitingForDebugger" in oopif_methods
+    # Never leak Runtime.enable into cross-origin Turnstile iframe!
+    assert "Runtime.enable" not in oopif_methods
+
+    # Persistent profile directory stays stable across `/` and `/feed/`
+    p1 = _get_persistent_profile_dir(headless=False, proxy_url=None)
+    p2 = _get_persistent_profile_dir(headless=False, proxy_url=None)
+    assert p1 == p2
+
+    # DataDome & Akamai challenge pages are recognized
+    assert _looks_like_js_challenge(
+        "<html><head><title>wsj.com</title></head><body><script src='https://ct.captcha-delivery.com/c.js'></script></body></html>"
+    ) is True
+    assert _looks_like_js_challenge(
+        "<html><head><title>Access Denied</title></head><body>Reference #18.2d34.edgesuite.net</body></html>"
+    ) is True
+
+

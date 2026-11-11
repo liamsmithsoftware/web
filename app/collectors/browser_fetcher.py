@@ -1,13 +1,14 @@
 """
 لایه مرورگر واقعی بدون پنجره مزاحم (Stealth Raw CDP over Local Chrome / Microsoft Edge)
-برای عبور خودکار از چالش‌های جاوااسکریپتی Cloudflare و Turnstile بدون نیاز به دانلود
-مرورگر جداگانه (در ویندوز ۱۰ و ۱۱ به صورت پیش‌فرض از Edge یا Chrome نصب‌شده روی سیستم
-استفاده می‌کند)، با بازنویسی کامل Client Hints (Sec-Ch-Ua) و بدون فعال‌سازی Runtime.enable.
+برای عبور خودکار از چالش‌های جاوااسکریپتی Cloudflare، Turnstile (شامل iframeهای مجزای
+OOPIF در challenges.cloudflare.com)، Akamai و DataDome بدون نیاز به دانلود مرورگر جداگانه
+و بدون فعال‌سازی Runtime.enable.
 """
 from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import http.client
 import json
 import os
@@ -48,6 +49,7 @@ CHALLENGE_TITLE_MARKERS = (
     "one moment, please",
     "verifying you are human",
     "verify you are human",
+    "access denied",
 )
 
 ACTIVE_CHALLENGE_DOM_MARKERS = (
@@ -58,18 +60,19 @@ ACTIVE_CHALLENGE_DOM_MARKERS = (
     'id="turnstile-wrapper"',
     'class="cf-turnstile"',
     "challenges.cloudflare.com/turnstile",
+    "challenges.cloudflare.com/cdn-cgi/challenge-platform",
     "/cdn-cgi/challenge-platform/h/",
+    "captcha-delivery.com",
+    "geo.captcha-delivery.com",
 )
 
 STEALTH_INIT_SCRIPT = """
 (() => {
     try {
-        if (navigator.webdriver) {
-            Object.defineProperty(navigator, 'webdriver', {
-                get: () => false,
-                configurable: true
-            });
-        }
+        Object.defineProperty(navigator, 'webdriver', {
+            get: () => false,
+            configurable: true
+        });
         if (!window.chrome) {
             Object.defineProperty(window, 'chrome', {
                 value: { runtime: {}, app: { isInstalled: false } },
@@ -77,13 +80,17 @@ STEALTH_INIT_SCRIPT = """
             });
         }
         if (!window.outerWidth || window.outerWidth === 0) {
-            Object.defineProperty(window, 'outerWidth', { get: () => window.innerWidth || 1366, configurable: true });
+            Object.defineProperty(window, 'outerWidth', { get: () => window.innerWidth || 1280, configurable: true });
         }
         if (!window.outerHeight || window.outerHeight === 0) {
-            Object.defineProperty(window, 'outerHeight', { get: () => (window.innerHeight || 700) + 68, configurable: true });
+            Object.defineProperty(window, 'outerHeight', { get: () => (window.innerHeight || 720) + 68, configurable: true });
         }
         if (!navigator.languages || navigator.languages.length === 0) {
             Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'], configurable: true });
+        }
+        if (document.visibilityState === 'hidden') {
+            Object.defineProperty(document, 'visibilityState', { get: () => 'visible', configurable: true });
+            Object.defineProperty(document, 'hidden', { get: () => false, configurable: true });
         }
     } catch (_) {}
 })();
@@ -95,6 +102,7 @@ class ClearanceEntry:
     cookie_header: str
     user_agent: str
     expires_at: float
+    via_browser: bool = True
 
 
 class DomainClearanceCache:
@@ -129,6 +137,7 @@ class DomainClearanceCache:
         *,
         cookie_header: str,
         user_agent: str,
+        via_browser: bool = True,
     ) -> None:
         domain = self._base_domain(url)
         if not domain or not cookie_header:
@@ -137,6 +146,7 @@ class DomainClearanceCache:
             cookie_header=cookie_header,
             user_agent=user_agent,
             expires_at=time.time() + self.TTL_SECONDS,
+            via_browser=via_browser,
         )
 
     def clear(self) -> None:
@@ -144,7 +154,8 @@ class DomainClearanceCache:
 
 
 CLEARANCE_CACHE = DomainClearanceCache()
-_BROWSER_SEMAPHORE = asyncio.Semaphore(2)
+# Serialize local browser launches (1 at a time) so persistent profile cookie jars never collide
+_BROWSER_SEMAPHORE = asyncio.Semaphore(1)
 # Domains whose strict Turnstile challenge required an off-screen non-headless window
 _GUI_REQUIRED_DOMAINS: Set[str] = set()
 
@@ -209,12 +220,32 @@ def find_local_browser_executable() -> Optional[str]:
 
 
 def _can_use_gui_fallback() -> bool:
-    """True when the OS has a desktop session where an off-screen minimized browser can run."""
+    """True when the OS has a desktop session where an off-screen unminimized window can run."""
     if (os.getenv("WEB_COLLECTOR_HEADLESS_ONLY") or "").strip() == "1":
         return False
     if os.name == "nt" or sys.platform == "darwin":
         return True
     return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
+
+def _get_persistent_profile_dir(*, headless: bool, proxy_url: Optional[str]) -> str:
+    """
+    Returns a reusable Chromium profile directory (safe under `_BROWSER_SEMAPHORE = Semaphore(1)`)
+    so solved `cf_clearance` cookies, TLS session resumption tickets, and Cloudflare Private State
+    Tokens persist across `/` -> `/feed/` -> `/wp-json/` and subsequent syncs.
+    """
+    proxy_tag = hashlib.sha1((proxy_url or "direct").encode("utf-8")).hexdigest()[:8]
+    mode_tag = "hl" if headless else "gui"
+    profile_path = Path(tempfile.gettempdir()) / f"wcc_cdp_profile_{mode_tag}_{proxy_tag}"
+    profile_path.mkdir(parents=True, exist_ok=True)
+    for lock_name in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+        lock_file = profile_path / lock_name
+        try:
+            if lock_file.exists() or lock_file.is_symlink():
+                lock_file.unlink()
+        except Exception:
+            pass
+    return str(profile_path)
 
 
 def _pick_ephemeral_port() -> int:
@@ -252,9 +283,12 @@ def _looks_like_js_challenge(html: str) -> bool:
         or "turnstile" in head
         or "challenge-platform" in head
         or "ddos-guard" in head
+        or "captcha-delivery.com" in head
+        or "datadome" in head
+        or "edgesuite.net" in head
     ):
         return True
-    # Newer Cloudflare Turnstile templates set <title> to the domain name while running _cf_chl_opt
+    # Newer Cloudflare Turnstile / DataDome templates set <title> to the domain name
     if len(raw) < 48_000:
         lower_body = raw.lower()
         if any(marker in lower_body for marker in ACTIVE_CHALLENGE_DOM_MARKERS):
@@ -264,9 +298,9 @@ def _looks_like_js_challenge(html: str) -> bool:
 
 def _build_ua_override_params(raw_ua: str, browser_bin: str = "") -> Dict[str, Any]:
     """
-    Constructs `Network.setUserAgentOverride` parameters including full `userAgentMetadata`
-    so `Sec-Ch-Ua` HTTP Client Hints AND `navigator.userAgentData` replace `HeadlessChrome`
-    with genuine `Google Chrome` or `Microsoft Edge` brands.
+    Constructs `Emulation.setUserAgentOverride` / `Network.setUserAgentOverride` parameters
+    including full `userAgentMetadata` so `Sec-Ch-Ua` HTTP Client Hints AND
+    `navigator.userAgentData` replace `HeadlessChrome` with genuine `Google Chrome` or `Microsoft Edge`.
     """
     clean_ua = (raw_ua or "").replace("HeadlessChrome/", "Chrome/").strip()
     if not clean_ua:
@@ -350,18 +384,55 @@ def _normalize_chromium_proxy(proxy_url: Optional[str]) -> Optional[str]:
 
 
 class _RawCdpClient:
-    """Minimal CDP client that tracks events without ever invoking Runtime.enable."""
+    """
+    Minimal CDP client that tracks main-frame responses AND automatically applies Client Hints +
+    stealth init scripts to cross-origin OOPIF subtargets (e.g. `challenges.cloudflare.com`)
+    without ever invoking `Runtime.enable`.
+    """
 
-    def __init__(self, ws: Any) -> None:
+    def __init__(self, ws: Any, *, ua_override: Optional[Dict[str, Any]] = None) -> None:
         self._ws = ws
+        self._ua_override = ua_override
         self._next_id = 0
         self._pending: Dict[int, asyncio.Future[Dict[str, Any]]] = {}
+        self._bg_tasks: Set[asyncio.Task[Any]] = set()
         self.doc_status: int = 200
         self.doc_url: str = ""
         self.doc_headers: Dict[str, str] = {}
         self.doc_request_id: Optional[str] = None
         self.load_fired = asyncio.Event()
         self._reader_task = asyncio.create_task(self._reader_loop())
+
+    async def _configure_child_target(self, session_id: str, waiting_for_debugger: bool) -> None:
+        """Applies UA Client Hints & stealth script to cross-origin Turnstile iframes before they execute."""
+        try:
+            if self._ua_override:
+                await self.call(
+                    "Emulation.setUserAgentOverride",
+                    self._ua_override,
+                    timeout=3.0,
+                    session_id=session_id,
+                )
+            await self.call("Page.enable", {}, timeout=3.0, session_id=session_id)
+            await self.call(
+                "Page.addScriptToEvaluateOnNewDocument",
+                {"source": STEALTH_INIT_SCRIPT},
+                timeout=3.0,
+                session_id=session_id,
+            )
+        except Exception:
+            pass
+        finally:
+            if waiting_for_debugger:
+                try:
+                    await self.call(
+                        "Runtime.runIfWaitingForDebugger",
+                        {},
+                        timeout=3.0,
+                        session_id=session_id,
+                    )
+                except Exception:
+                    pass
 
     async def _reader_loop(self) -> None:
         try:
@@ -379,11 +450,26 @@ class _RawCdpClient:
 
                 method = msg.get("method", "")
                 params = msg.get("params") or {}
+                msg_session = msg.get("sessionId")
+
+                if method == "Target.attachedToTarget":
+                    child_sid = str(params.get("sessionId") or "")
+                    waiting = bool(params.get("waitingForDebugger"))
+                    if child_sid:
+                        task = asyncio.create_task(self._configure_child_target(child_sid, waiting))
+                        self._bg_tasks.add(task)
+                        task.add_done_callback(self._bg_tasks.discard)
+                    continue
+
+                # Track main-frame document responses only (ignore child OOPIF session events)
+                if msg_session:
+                    continue
+
                 if method == "Network.responseReceived":
                     if params.get("type") == "Document":
                         resp = params.get("response") or {}
                         url_val = str(resp.get("url") or "")
-                        if url_val.startswith(("http://", "https://")):
+                        if url_val.startswith(("http://", "https://")) and "challenges.cloudflare.com" not in url_val:
                             self.doc_status = int(resp.get("status") or 200)
                             self.doc_url = url_val
                             raw_hdrs = resp.get("headers") or {}
@@ -398,14 +484,22 @@ class _RawCdpClient:
                 if not fut.done():
                     fut.set_result({"error": {"message": "closed"}})
 
-    async def call(self, method: str, params: Optional[Dict[str, Any]] = None, timeout: float = 8.0) -> Dict[str, Any]:
+    async def call(
+        self,
+        method: str,
+        params: Optional[Dict[str, Any]] = None,
+        timeout: float = 8.0,
+        session_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
         self._next_id += 1
         req_id = self._next_id
         loop = asyncio.get_running_loop()
         fut: asyncio.Future[Dict[str, Any]] = loop.create_future()
         self._pending[req_id] = fut
-        payload = json.dumps({"id": req_id, "method": method, "params": params or {}})
-        await self._ws.send(payload)
+        msg_obj: Dict[str, Any] = {"id": req_id, "method": method, "params": params or {}}
+        if session_id:
+            msg_obj["sessionId"] = session_id
+        await self._ws.send(json.dumps(msg_obj))
         resp = await asyncio.wait_for(fut, timeout=timeout)
         return resp.get("result") or {}
 
@@ -436,6 +530,8 @@ class _RawCdpClient:
 
     async def close(self) -> None:
         self._reader_task.cancel()
+        for t in list(self._bg_tasks):
+            t.cancel()
         try:
             await self._ws.close()
         except Exception:
@@ -445,77 +541,104 @@ class _RawCdpClient:
 async def _nudge_turnstile_if_present(cdp: _RawCdpClient) -> None:
     """
     Provides natural pointer movement entropy for Cloudflare Managed Challenges and, if an
-    interactive Turnstile checkbox iframe is visible in the DOM, clicks its checkbox region.
-    Uses ONLY Input & DOM CDP domains (never Runtime.enable).
+    interactive Turnstile checkbox iframe or host wrapper is present (even inside closed Shadow DOM),
+    clicks its checkbox region. Uses ONLY Input & DOM CDP domains (never Runtime.enable).
     """
     try:
-        for x, y in ((180, 220), (260, 275), (320, 310)):
+        for x, y in ((180, 220), (255, 270), (315, 305)):
             await cdp.call(
                 "Input.dispatchMouseEvent",
-                {"type": "mouseMoved", "x": x, "y": y, "button": "none"},
+                {"type": "mouseMoved", "x": x, "y": y, "button": "none", "pointerType": "mouse"},
                 timeout=2.0,
             )
             await asyncio.sleep(0.06)
 
         flat = await cdp.call("DOM.getFlattenedDocument", {"depth": -1, "pierce": True}, timeout=3.0)
         nodes = flat.get("nodes") or []
+        candidate_node_ids: List[int] = []
+
         for node in nodes:
-            if not isinstance(node, dict) or str(node.get("nodeName") or "").upper() != "IFRAME":
+            if not isinstance(node, dict):
                 continue
+            n_name = str(node.get("nodeName") or "").upper()
             attrs = node.get("attributes") or []
             attr_map = {
                 str(attrs[i]).lower(): str(attrs[i + 1])
                 for i in range(0, len(attrs) - 1, 2)
             }
-            src = attr_map.get("src", "").lower()
-            title = attr_map.get("title", "").lower()
-            if (
-                "challenges.cloudflare.com" in src
-                or "turnstile" in src
-                or "cloudflare security challenge" in title
-            ):
-                node_id = node.get("nodeId")
-                if not node_id:
-                    continue
-                box = await cdp.call("DOM.getBoxModel", {"nodeId": node_id}, timeout=2.0)
+            nid = node.get("nodeId")
+            if not isinstance(nid, int):
+                continue
+
+            if n_name == "IFRAME":
+                src = attr_map.get("src", "").lower()
+                title = attr_map.get("title", "").lower()
+                elem_id = attr_map.get("id", "").lower()
+                if (
+                    "challenges.cloudflare.com" in src
+                    or "turnstile" in src
+                    or "cf-chl-widget" in elem_id
+                    or "cloudflare security challenge" in title
+                ):
+                    candidate_node_ids.insert(0, nid)
+            elif n_name == "DIV":
+                elem_id = attr_map.get("id", "").lower()
+                elem_cls = attr_map.get("class", "").lower()
+                if elem_id in ("turnstile-wrapper", "challenge-stage", "cf-turnstile") or "cf-turnstile" in elem_cls:
+                    candidate_node_ids.append(nid)
+
+        for target_nid in candidate_node_ids:
+            try:
+                box = await cdp.call("DOM.getBoxModel", {"nodeId": target_nid}, timeout=2.0)
                 content_quad = (box.get("model") or {}).get("content")
-                if isinstance(content_quad, list) and len(content_quad) >= 8:
-                    left_x = float(content_quad[0])
-                    top_y = float(content_quad[1])
-                    bottom_y = float(content_quad[5])
-                    height = max(20.0, bottom_y - top_y)
-                    click_x = int(left_x + 28)
-                    click_y = int(top_y + height / 2.0)
-                    await cdp.call(
-                        "Input.dispatchMouseEvent",
-                        {"type": "mouseMoved", "x": click_x, "y": click_y, "button": "none"},
-                        timeout=2.0,
-                    )
-                    await asyncio.sleep(0.08)
-                    await cdp.call(
-                        "Input.dispatchMouseEvent",
-                        {
-                            "type": "mousePressed",
-                            "x": click_x,
-                            "y": click_y,
-                            "button": "left",
-                            "clickCount": 1,
-                        },
-                        timeout=2.0,
-                    )
-                    await asyncio.sleep(0.05)
-                    await cdp.call(
-                        "Input.dispatchMouseEvent",
-                        {
-                            "type": "mouseReleased",
-                            "x": click_x,
-                            "y": click_y,
-                            "button": "left",
-                            "clickCount": 1,
-                        },
-                        timeout=2.0,
-                    )
-                    break
+                if not isinstance(content_quad, list) or len(content_quad) < 8:
+                    continue
+                left_x = float(content_quad[0])
+                right_x = float(content_quad[2])
+                top_y = float(content_quad[1])
+                bottom_y = float(content_quad[5])
+                width = right_x - left_x
+                height = bottom_y - top_y
+                if width < 40 or height < 20:
+                    continue
+                click_x = int(left_x + 28)
+                click_y = int(top_y + min(34.0, height / 2.0))
+                await cdp.call(
+                    "Input.dispatchMouseEvent",
+                    {"type": "mouseMoved", "x": click_x, "y": click_y, "button": "none", "pointerType": "mouse"},
+                    timeout=2.0,
+                )
+                await asyncio.sleep(0.08)
+                await cdp.call(
+                    "Input.dispatchMouseEvent",
+                    {
+                        "type": "mousePressed",
+                        "x": click_x,
+                        "y": click_y,
+                        "button": "left",
+                        "buttons": 1,
+                        "clickCount": 1,
+                        "pointerType": "mouse",
+                    },
+                    timeout=2.0,
+                )
+                await asyncio.sleep(0.06)
+                await cdp.call(
+                    "Input.dispatchMouseEvent",
+                    {
+                        "type": "mouseReleased",
+                        "x": click_x,
+                        "y": click_y,
+                        "button": "left",
+                        "buttons": 0,
+                        "clickCount": 1,
+                        "pointerType": "mouse",
+                    },
+                    timeout=2.0,
+                )
+                break
+            except Exception:
+                continue
     except Exception:
         return
 
@@ -531,7 +654,7 @@ async def _run_single_browser_attempt(
     timeout_sec: float,
 ) -> Optional[Dict[str, Any]]:
     debug_port = _pick_ephemeral_port()
-    profile_dir = tempfile.mkdtemp(prefix="wcc_cdp_")
+    profile_dir = _get_persistent_profile_dir(headless=headless, proxy_url=proxy_url)
     proc: Optional[subprocess.Popen[bytes]] = None
     chromium_proxy = _normalize_chromium_proxy(proxy_url)
 
@@ -539,12 +662,15 @@ async def _run_single_browser_attempt(
     if headless:
         cmd.extend(["--headless=new", "--window-size=1366,768"])
     else:
-        # Off-screen + minimized so Turnstile gets genuine compositor/GPU signals without disturbing the user
+        # Unminimized off-screen window so `document.visibilityState === 'visible'` and
+        # `requestAnimationFrame` runs at full speed for Turnstile without stealing user focus!
         cmd.extend(
             [
-                "--window-position=-32000,-32000",
+                "--window-position=-3200,-3200",
                 "--window-size=1280,800",
-                "--start-minimized",
+                "--disable-background-timer-throttling",
+                "--disable-backgrounding-occluded-windows",
+                "--disable-renderer-backgrounding",
             ]
         )
 
@@ -557,7 +683,6 @@ async def _run_single_browser_attempt(
             "--no-default-browser-check",
             "--disable-blink-features=AutomationControlled",
             "--disable-extensions",
-            "--disable-background-networking",
             "--disable-sync",
             "--mute-audio",
             "--lang=en-US",
@@ -581,8 +706,8 @@ async def _run_single_browser_attempt(
         else:
             startupinfo = subprocess.STARTUPINFO()  # type: ignore[attr-defined]
             startupinfo.dwFlags |= getattr(subprocess, "STARTF_USESHOWWINDOW", 1)
-            # SW_SHOWMINNOACTIVE = 7 (minimized without stealing focus)
-            startupinfo.wShowWindow = 7
+            # SW_SHOWNOACTIVATE = 4 (unminimized so visibilityState='visible', without stealing focus!)
+            startupinfo.wShowWindow = 4
             popen_kwargs["startupinfo"] = startupinfo
 
     try:
@@ -612,16 +737,25 @@ async def _run_single_browser_attempt(
         clean_ua = str(ua_override["userAgent"])
 
         async with ws_connect(ws_url, max_size=32 * 1024 * 1024) as ws:
-            cdp = _RawCdpClient(ws)
+            cdp = _RawCdpClient(ws, ua_override=ua_override)
             try:
                 await cdp.call("Network.enable")
                 await cdp.call("Page.enable")
                 await cdp.call("DOM.enable")
                 await cdp.call("Network.setUserAgentOverride", ua_override)
+                await cdp.call("Emulation.setUserAgentOverride", ua_override)
                 await cdp.call(
                     "Page.addScriptToEvaluateOnNewDocument",
                     {"source": STEALTH_INIT_SCRIPT},
                 )
+                # Auto-attach to cross-origin OOPIF targets (e.g. challenges.cloudflare.com)
+                try:
+                    await cdp.call(
+                        "Target.setAutoAttach",
+                        {"autoAttach": True, "waitForDebuggerOnStart": True, "flatten": True},
+                    )
+                except Exception:
+                    pass
 
                 if custom_cookie:
                     parsed_target = urlparse(url)
@@ -652,13 +786,13 @@ async def _run_single_browser_attempt(
                 html = await cdp.get_outer_html()
 
                 nudged = False
-                wait_deadline = time.monotonic() + min(18.0, max(9.0, timeout_sec - 4.0))
+                wait_deadline = time.monotonic() + min(20.0, max(10.0, timeout_sec - 3.0))
                 poll_idx = 0
                 while time.monotonic() < wait_deadline and (
                     cdp.doc_status in (403, 429, 503) or _looks_like_js_challenge(html)
                 ):
                     poll_idx += 1
-                    if poll_idx in (2, 6) or not nudged:
+                    if poll_idx in (2, 5, 9) or not nudged:
                         nudged = True
                         await _nudge_turnstile_if_present(cdp)
                     await asyncio.sleep(1.0)
@@ -696,7 +830,14 @@ async def _run_single_browser_attempt(
                             proxy_url,
                             cookie_header="; ".join(relevant_pairs),
                             user_agent=clean_ua,
+                            via_browser=True,
                         )
+
+                # Ask Chromium to flush cookies cleanly to persistent profile before exit
+                try:
+                    await cdp.call("Browser.close", {}, timeout=1.5)
+                except Exception:
+                    pass
 
                 return {
                     "url": cdp.doc_url or url,
@@ -713,11 +854,13 @@ async def _run_single_browser_attempt(
     finally:
         if proc is not None:
             try:
-                proc.kill()
-                proc.wait(timeout=4)
+                proc.wait(timeout=1.5)
             except Exception:
-                pass
-        shutil.rmtree(profile_dir, ignore_errors=True)
+                try:
+                    proc.kill()
+                    proc.wait(timeout=3)
+                except Exception:
+                    pass
 
 
 async def fetch_via_local_browser(
@@ -729,12 +872,12 @@ async def fetch_via_local_browser(
     timeout_sec: float = 25.0,
 ) -> Optional[Dict[str, Any]]:
     """
-    Solves Cloudflare JS Managed Challenges & Turnstile using the locally installed
-    Chrome/Edge/Brave browser:
-      - Pass 1: Invisible `--headless=new` with full Client Hints (`userAgentMetadata`) + GPU.
-      - Pass 2: If Turnstile still loops in headless mode and a desktop session is available
-                (Windows/macOS/GUI Linux), retries in an off-screen minimized window without
-                stealing focus and caches `cf_clearance` for 25 minutes.
+    Solves Cloudflare JS Managed Challenges, Cross-Origin Turnstile OOPIFs, Akamai, & DataDome
+    using the locally installed Chrome/Edge/Brave browser:
+      - Pass 1: Invisible `--headless=new` with OOPIF Client Hints (`Target.setAutoAttach`) + GPU.
+      - Pass 2: If Turnstile still loops in headless mode and a desktop session is available,
+                retries in an off-screen unminimized (`SW_SHOWNOACTIVATE`) window with persistent
+                cookie/token profile so `/` and `/feed/` pass without disturbing the user.
     """
     if not HAS_WEBSOCKETS or ws_connect is None:
         return None
@@ -781,7 +924,7 @@ async def fetch_via_local_browser(
                 proxy_url=proxy_url,
                 verify_ssl=verify_ssl,
                 custom_cookie=custom_cookie,
-                timeout_sec=max(22.0, timeout_sec),
+                timeout_sec=max(24.0, timeout_sec),
             )
             if res_gui is not None:
                 if res_gui.get("solved") and target_domain:

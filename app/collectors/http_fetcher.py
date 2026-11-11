@@ -196,6 +196,13 @@ def _merge_cookies(user_cookie: str, cached_cookie: str) -> str:
     return "; ".join(parts)
 
 
+def _is_ssl_cert_error(exc: Exception) -> bool:
+    if isinstance(exc, ssl.SSLError) or isinstance(getattr(exc, "__cause__", None), ssl.SSLError):
+        return True
+    msg = str(exc).upper()
+    return "SSL" in msg or "CERTIFICATE" in msg or "CERT_" in msg
+
+
 class SmartHttpFetcher:
     """
     4-Layer Resilient HTTP Client:
@@ -304,6 +311,7 @@ class SmartHttpFetcher:
         effective_timeout = fast_timeout or self.timeout_sec
         best_resp: Optional[HttpFetchResponse] = None
         httpx_exc: Optional[Exception] = None
+        ssl_verify_for_target = self.verify_ssl
 
         # Layer 1: Standard httpx (ALWAYS with HTTP/2 + Chrome ciphers so http:// -> https:// redirects work!)
         try:
@@ -313,12 +321,32 @@ class SmartHttpFetcher:
                 accept_kind=accept_kind,
                 referer=referer,
                 timeout_sec=effective_timeout,
+                verify_override=ssl_verify_for_target,
             )
             best_resp = httpx_resp
             if not is_waf_challenge(httpx_resp.status_code, httpx_resp.text, httpx_resp.headers):
                 return httpx_resp
         except (httpx.ProxyError, httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout) as exc:
-            httpx_exc = exc
+            # Recover automatically when a site uses DoD/national Root CAs (e.g. .mil) or an incomplete
+            # intermediate/vanity-redirect certificate chain missing from Python's static certifi bundle
+            if ssl_verify_for_target and _is_ssl_cert_error(exc):
+                ssl_verify_for_target = False
+                try:
+                    httpx_resp = await self._fetch_httpx(
+                        url,
+                        proxy_url=proxy_url,
+                        accept_kind=accept_kind,
+                        referer=referer,
+                        timeout_sec=effective_timeout,
+                        verify_override=False,
+                    )
+                    best_resp = httpx_resp
+                    if not is_waf_challenge(httpx_resp.status_code, httpx_resp.text, httpx_resp.headers):
+                        return httpx_resp
+                except (httpx.ProxyError, httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout) as exc2:
+                    httpx_exc = exc2
+            else:
+                httpx_exc = exc
 
         # Layer 2: Escalate to curl_cffi real browser TLS/JA3/JA4/HTTP2 impersonation
         if HAS_CURL_CFFI and not _is_loopback_target(url):
@@ -328,6 +356,7 @@ class SmartHttpFetcher:
                 accept_kind=accept_kind,
                 referer=referer,
                 timeout_sec=effective_timeout,
+                verify_override=ssl_verify_for_target,
             )
             if imp_resp is not None:
                 best_resp = imp_resp
@@ -351,6 +380,7 @@ class SmartHttpFetcher:
                     accept_kind="feed",
                     referer=origin_ref,
                     timeout_sec=effective_timeout,
+                    verify_override=ssl_verify_for_target,
                 )
                 if alt_resp.status_code < 400 and not is_waf_challenge(
                     alt_resp.status_code, alt_resp.text, alt_resp.headers
@@ -371,11 +401,17 @@ class SmartHttpFetcher:
                 or is_waf_challenge(best_resp.status_code, best_resp.text, best_resp.headers)
             )
         ):
+            target_for_browser = best_resp.url if (best_resp and best_resp.url) else url
+            clearance = CLEARANCE_CACHE.get(target_for_browser, proxy_url)
+            merged_browser_cookie = _merge_cookies(
+                (self.settings.get("custom_cookie") or "").strip(),
+                clearance.cookie_header if clearance else "",
+            )
             browser_res = await fetch_via_local_browser(
-                best_resp.url if (best_resp and best_resp.url) else url,
+                target_for_browser,
                 proxy_url=proxy_url,
-                verify_ssl=self.verify_ssl,
-                custom_cookie=(self.settings.get("custom_cookie") or "").strip(),
+                verify_ssl=ssl_verify_for_target,
+                custom_cookie=merged_browser_cookie,
                 timeout_sec=max(18.0, self.timeout_sec),
             )
             if browser_res is not None:
@@ -407,6 +443,7 @@ class SmartHttpFetcher:
         accept_kind: str,
         referer: Optional[str],
         timeout_sec: float,
+        verify_override: Optional[bool] = None,
     ) -> HttpFetchResponse:
         effective_settings = dict(self.settings)
         clearance = CLEARANCE_CACHE.get(url, proxy_url)
@@ -423,7 +460,8 @@ class SmartHttpFetcher:
         )
         # Always enable HTTP/2 and Chrome TLS ciphers (even on http:// URLs that 301-redirect to https://!)
         use_h2 = HAS_HTTP2 and not (proxy_url and proxy_url.startswith("socks"))
-        verify_arg = _build_ssl_context(self.verify_ssl)
+        use_verify = self.verify_ssl if verify_override is None else verify_override
+        verify_arg = _build_ssl_context(use_verify)
 
         async with httpx.AsyncClient(
             headers=headers,
@@ -452,9 +490,12 @@ class SmartHttpFetcher:
         accept_kind: str,
         referer: Optional[str],
         timeout_sec: float,
+        verify_override: Optional[bool] = None,
     ) -> Optional[HttpFetchResponse]:
         if not HAS_CURL_CFFI or CurlAsyncSession is None:
             return None
+
+        use_verify = self.verify_ssl if verify_override is None else verify_override
 
         curl_proxy = _to_curl_proxy(proxy_url)
         # Upgrade initial http:// to https:// probe candidate only on redirect; let curl follow naturally
@@ -490,7 +531,7 @@ class SmartHttpFetcher:
             try:
                 async with CurlAsyncSession(
                     impersonate=profile,
-                    verify=self.verify_ssl,
+                    verify=use_verify,
                     proxy=curl_proxy,
                     timeout=timeout_sec,
                     allow_redirects=True,
