@@ -18,7 +18,7 @@ SKIP_PATH_PATTERNS = re.compile(
     r"(?:^|/)(?:"
     r"login|signin|sign-in|signup|sign-up|register|logout|account|profile|cart|checkout|"
     r"contact|contact-us|about|about-us|privacy|privacy-policy|terms|faq|ads|advertise|"
-    r"donate|subscribe|newsletter|careers|jobs|press-kit|"
+    r"donate|subscribe|newsletter|careers|jobs|press-kit|capabilities|sectors|services|partners|"
     r"search|wp-login\.php|wp-admin|wp-json|xmlrpc\.php|feed|rss|atom|sitemap|"
     r"tag|tags|issue|issues|topic|topics|category|categories|team|staff|experts|"
     r"author|authors|users|comment|comments|reply"
@@ -34,6 +34,7 @@ STATIC_ASSET_EXT_RE = re.compile(
 ARTICLE_HINT_URL_RE = re.compile(
     r"(?:/\d{4}/\d{1,2}/|/\d{4,}|"
     r"/(?:news|post|posts|article|articles|blog|story|content|fa/news|detail|view|"
+    r"online-analysis|strategic-comments|military-balance|"
     r"analysis|podcasts|podcast|in_the_news|research|reports|report|insights|insight|"
     r"publications|publication|commentary|opinions|opinion|briefs|brief|press-releases)/|"
     r"[?&](?:p|id|newsid)=\d+)",
@@ -385,15 +386,21 @@ def extract_listing_posts(
             if not guid or guid in posts_by_guid:
                 continue
 
-            h_inside = a_tag.find(["h1", "h2", "h3", "h4", "h5"])
-            title_el = h_inside or a_tag.select_one('[class*="title"], [class*="headline"]')
+            h_inside = a_tag.find(["h1", "h2", "h3", "h4", "h5", "h6"])
+            title_el = h_inside or a_tag.select_one('[class*="title"], [class*="headline"], [class*="heading"]')
+            if not title_el:
+                strong_el = a_tag.find(["strong", "b"])
+                if strong_el and len(strong_el.get_text(" ", strip=True)) >= 12:
+                    title_el = strong_el
+
+            full_anchor_text = re.sub(r"\s+", " ", a_tag.get_text(" ", strip=True)).strip()
             if title_el and len(title_el.get_text(" ", strip=True)) >= 8:
                 text = re.sub(r"\s+", " ", title_el.get_text(" ", strip=True)).strip()
             else:
-                text = re.sub(r"\s+", " ", a_tag.get_text(" ", strip=True)).strip()
+                text = full_anchor_text
 
-            in_heading = a_tag.find_parent(["h1", "h2", "h3", "h4", "h5"]) is not None or bool(
-                h_inside
+            in_heading = a_tag.find_parent(["h1", "h2", "h3", "h4", "h5", "h6"]) is not None or bool(
+                h_inside or title_el
             )
             url_looks_article = bool(ARTICLE_HINT_URL_RE.search(norm_url)) or norm_url.count("/") >= 4
 
@@ -402,14 +409,29 @@ def extract_listing_posts(
             if len(text) < min_len:
                 continue
 
+            card_summary_parts = [
+                p_el.get_text(" ", strip=True)
+                for p_el in a_tag.find_all("p")
+                if len(p_el.get_text(" ", strip=True)) >= 20
+                and p_el.get_text(" ", strip=True) != text
+            ]
+            card_content = f"{text}\n\n{card_summary_parts[0]}".strip() if card_summary_parts else text
+
             parent_box = a_tag.find_parent(["li", "div", "section"]) or a_tag
             pub_dt = _extract_datetime_from_tag(a_tag, tz_name=tz_name) or _extract_datetime_from_tag(
                 parent_box, tz_name=tz_name
             )
             if pub_dt is None:
-                # Fallback: scan short card text inside the anchor/card for inline dates (e.g. "November 9th")
-                card_snippet = a_tag.get_text(" ", strip=True)[:220]
-                pub_dt = parse_any_datetime(card_snippet, tz_name=tz_name)
+                # Scan tail first (bylines like "...By Author 6th November 2026" on iiss.org), then head
+                tail_snippet = full_anchor_text[-140:] if len(full_anchor_text) > 140 else ""
+                pub_dt = (
+                    parse_any_datetime(tail_snippet, tz_name=tz_name)
+                    or parse_any_datetime(full_anchor_text[:240], tz_name=tz_name)
+                )
+            if pub_dt is None and parent_box is not a_tag:
+                # Sibling date label above/below heading (e.g. bicom.org.uk Elementor cards)
+                box_snippet = re.sub(r"\s+", " ", parent_box.get_text(" ", strip=True))[:220]
+                pub_dt = parse_any_datetime(box_snippet, tz_name=tz_name)
             img_url = _extract_img_url(parent_box, norm_url)
 
             post = FetchedPost(
@@ -417,10 +439,10 @@ def extract_listing_posts(
                 post_url=norm_url,
                 title=text[:240],
                 published_at=pub_dt,
-                content=text,
+                content=card_content,
                 media_type="photo" if img_url else "text",
                 media_url=img_url,
-                needs_article_fetch=True,
+                needs_article_fetch=len(card_content) < 240,
             )
             posts_by_guid[guid] = post
             ordered_guids.append(guid)

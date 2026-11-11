@@ -46,6 +46,7 @@ const TRIGGER_LABELS = {
 const SOURCE_MODE_LABELS = {
     rss: "فید RSS/Atom",
     wp_api: "وب‌سرویس وردپرس",
+    sitemap: "نقشه سایت (Sitemap)",
     html: "خزشگر HTML",
     auto: "هوشمند",
     demo: "نمونه",
