@@ -8,9 +8,12 @@ from pathlib import Path
 
 import pytest
 
+from app.collectors.base import CollectorError
+from app.collectors.browser_fetcher import CLEARANCE_CACHE
 from app.collectors.html_scraper import extract_listing_posts
-from app.collectors.http_fetcher import SmartHttpFetcher, resolve_proxy_candidates
-from app.collectors.web_collector import WebSiteCollector
+from app.collectors.http_fetcher import HttpFetchResponse, SmartHttpFetcher, resolve_proxy_candidates
+from app.collectors.sitemap_parser import extract_child_sitemaps, parse_sitemap_posts
+from app.collectors.web_collector import WebSiteCollector, _https_upgrade_candidate
 from app.collectors.wp_api_parser import parse_wp_posts_json
 from app.database import DEFAULT_SETTINGS
 from app.utils.jalali import parse_any_datetime
@@ -66,13 +69,76 @@ FDD_LIKE_HTML_NO_FEED_TAG = """<!DOCTYPE html>
 </html>
 """
 
+IISS_AND_RASMUSSEN_LIKE_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <title>The International Institute for Strategic Studies</title>
+</head>
+<body>
+    <a href="/capabilities/political-analysis-and-advisory/"><strong>Political Analysis and Advisory</strong></a>
+    <a href="/sectors/">Sectors</a>
+
+    <div class="hero-card">
+        <a href="/online-analysis/online-analysis/2026/11/the-consequences-of-the-us-midterm-elections/">
+            <span>Online Analysis</span>
+            <strong>The consequences of the US midterm elections</strong>
+            <p>On 3 November 2026, American voters delivered a resounding defeat in midterm congressional elections across key states and districts, reshaping foreign policy priorities for the coming two years.</p>
+            <span>By Paul Fraioli, Benjamin Rhode6th November 2026</span>
+        </a>
+    </div>
+
+    <div class="item-card">
+        <a href="/publications/strategic-comments/2026/11/lebanon-a-ceasefire-without-peace/">
+            <span>Strategic Comments</span>
+            <strong>Lebanon: a ceasefire without peace</strong>
+            <span>Available5th November 2026</span>
+        </a>
+    </div>
+</body>
+</html>
+"""
+
+SAMPLE_SITEMAP_INDEX = """<?xml version="1.0" encoding="UTF-8"?>
+<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+    <sitemap><loc>https://example.org/page-sitemap.xml</loc></sitemap>
+    <sitemap><loc>https://example.org/post-sitemap.xml</loc></sitemap>
+    <sitemap><loc>https://example.org/news-sitemap.xml</loc></sitemap>
+</sitemapindex>
+"""
+
+SAMPLE_URLSET_SITEMAP = """<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"
+        xmlns:news="http://www.google.com/schemas/sitemap-news/0.9">
+    <url>
+        <loc>https://www.iiss.org/careers/jobs/2026/11/office-manager/</loc>
+        <lastmod>2026-11-10T10:00:00+00:00</lastmod>
+    </url>
+    <url>
+        <loc>https://www.iiss.org/podcasts/arms-control/2026/10/episode-1/transcript/</loc>
+        <lastmod>2026-11-10T09:00:00+00:00</lastmod>
+    </url>
+    <url>
+        <loc>https://www.iiss.org/online-analysis/2026/11/older-october-report/</loc>
+        <lastmod>2026-10-20T08:00:00+00:00</lastmod>
+    </url>
+    <url>
+        <loc>https://www.iiss.org/online-analysis/2026/11/newest-strategic-report/</loc>
+        <news:news>
+            <news:publication><news:name>IISS</news:name></news:publication>
+            <news:publication_date>2026-11-10T11:30:00+00:00</news:publication_date>
+            <news:title>Newest Strategic Report on European Defence</news:title>
+        </news:news>
+    </url>
+</urlset>
+"""
+
 
 class _WafAndWordPressMockHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):  # noqa: A002
         return
 
     def do_GET(self):  # noqa: N802
-        # Case 1: /blocked-home/ returns 403 Cloudflare challenge on HTML & /feed/, but /wp-json/ works!
         if self.path in ("/blocked-home", "/blocked-home/", "/blocked-home/feed/", "/blocked-home/feed"):
             self._send(
                 403,
@@ -85,7 +151,6 @@ class _WafAndWordPressMockHandler(BaseHTTPRequestHandler):
             self._send(200, "application/json; charset=utf-8", SAMPLE_WP_POSTS_JSON.encode("utf-8"))
             return
 
-        # Case 2: /fdd-like/ hides <link type="rss+xml"> in <head>, but exposes /fdd-like/feed/
         if self.path in ("/fdd-like", "/fdd-like/"):
             self._send(200, "text/html; charset=utf-8", FDD_LIKE_HTML_NO_FEED_TAG.encode("utf-8"))
             return
@@ -94,7 +159,6 @@ class _WafAndWordPressMockHandler(BaseHTTPRequestHandler):
             self._send(200, "application/rss+xml; charset=utf-8", (FIXTURES / "sample_rss.xml").read_bytes())
             return
 
-        # Case 3: Feed endpoint that rejects generic navigation Accept with 403 unless Referer + RSS Accept sent
         if self.path == "/strict-feed.xml":
             accept = self.headers.get("Accept", "")
             referer = self.headers.get("Referer", "")
@@ -142,6 +206,10 @@ def test_parse_english_named_and_ordinal_dates():
     assert dt3 is not None
     assert dt3.month == 11 and dt3.day == 9
 
+    # Glued date without space on iiss.org ("Available6th November 2026")
+    dt4 = parse_any_datetime("By Wakana Asano6th November 2026", tz_name="UTC")
+    assert dt4 == datetime(2026, 11, 6, 0, 0, tzinfo=timezone.utc)
+
 
 def test_parse_wordpress_rest_api_json():
     site_title, posts = parse_wp_posts_json(
@@ -156,7 +224,7 @@ def test_parse_wordpress_rest_api_json():
     assert p.published_at == datetime(2026, 11, 9, 21, 22, 13, tzinfo=timezone.utc)
 
 
-def test_fdd_like_html_scraping_skips_issue_links_and_extracts_clean_titles():
+def test_fdd_and_iiss_html_scraping_extracts_clean_titles_and_tail_dates():
     site_title, posts = extract_listing_posts(
         FDD_LIKE_HTML_NO_FEED_TAG, page_url="https://www.fdd.org/", tz_name="UTC"
     )
@@ -165,14 +233,98 @@ def test_fdd_like_html_scraping_skips_issue_links_and_extracts_clean_titles():
     assert "https://www.fdd.org/issue/iran" not in urls
     assert len(posts) == 2
     assert posts[0].title == "Lebanon Risks Its Future by Allowing Hezbollah to Weaponize Public Utilities"
-    assert posts[0].published_at is not None
+
+    iiss_title, iiss_posts = extract_listing_posts(
+        IISS_AND_RASMUSSEN_LIKE_HTML, page_url="https://www.iiss.org/", tz_name="UTC"
+    )
+    assert "International Institute for Strategic Studies" in (iiss_title or "")
+    # /capabilities/... and /sectors/ must be skipped
+    assert len(iiss_posts) == 2
+    assert iiss_posts[0].title == "The consequences of the US midterm elections"
+    assert "American voters delivered" in iiss_posts[0].content
+    # Picks tail publication date (6 Nov 2026), NOT body text date (3 Nov 2026)!
+    assert iiss_posts[0].published_at == datetime(2026, 11, 6, 0, 0, tzinfo=timezone.utc)
+    assert iiss_posts[1].title == "Lebanon: a ceasefire without peace"
+    assert iiss_posts[1].published_at == datetime(2026, 11, 5, 0, 0, tzinfo=timezone.utc)
+
+
+def test_sitemap_priority_and_news_sitemap_extraction():
+    children = extract_child_sitemaps(SAMPLE_SITEMAP_INDEX)
+    assert children[0] == "https://example.org/news-sitemap.xml"
+    assert children[1] == "https://example.org/post-sitemap.xml"
+
+    s_title, s_posts = parse_sitemap_posts(
+        SAMPLE_URLSET_SITEMAP, base_url="https://www.iiss.org/", tz_name="UTC"
+    )
+    assert s_title == "IISS"
+    # Careers/jobs and /transcript/ are skipped; remaining 2 sorted newest-first!
+    assert len(s_posts) == 2
+    assert s_posts[0].title == "Newest Strategic Report on European Defence"
+    assert s_posts[0].published_at == datetime(2026, 11, 10, 11, 30, tzinfo=timezone.utc)
+
+
+def test_http_to_https_upgrade_and_cloudflare_522_error_message():
+    assert _https_upgrade_candidate("http://www.bicom.org.uk/") == "https://www.bicom.org.uk/"
+    assert _https_upgrade_candidate("http://ravandinstitute.com") == "https://ravandinstitute.com/"
+    assert _https_upgrade_candidate("http://127.0.0.1:8000/") is None
+
+    cf_522 = HttpFetchResponse(url="https://ravandinstitute.com/", status_code=522, text="", headers={})
+    with pytest.raises(CollectorError) as exc_info:
+        cf_522.raise_for_status()
+    assert "522" in str(exc_info.value)
+    assert "سرور میزبانی اصلی" in str(exc_info.value)
+
+
+async def test_browser_cdp_escalation_and_clearance_cache_on_js_challenge(monkeypatch):
+    CLEARANCE_CACHE.clear()
+    CLEARANCE_CACHE.put(
+        "https://www.iiss.org/online-analysis/",
+        None,
+        cookie_header="cf_clearance=solved_token_123",
+        user_agent="Mozilla/5.0 Chrome/131.0.0.0",
+    )
+    cached = CLEARANCE_CACHE.get("https://www.iiss.org/publications/", None)
+    assert cached is not None
+    assert "cf_clearance=solved_token_123" in cached.cookie_header
+
+    # Simulate a domain where httpx & curl_cffi get 403 JS challenge, then browser_cdp solves it!
+    async def _fake_httpx(self, url, **kwargs):
+        return HttpFetchResponse(
+            url=url,
+            status_code=403,
+            text="<html><title>Just a moment...</title></html>",
+            headers={"cf-mitigated": "challenge"},
+            via="httpx",
+        )
+
+    async def _fake_curl(self, url, **kwargs):
+        return None
+
+    async def _fake_browser(url, **kwargs):
+        return {
+            "url": url,
+            "status_code": 200,
+            "text": IISS_AND_RASMUSSEN_LIKE_HTML,
+            "headers": {"content-type": "text/html; charset=utf-8"},
+            "via": "browser_cdp",
+        }
+
+    monkeypatch.setattr(SmartHttpFetcher, "_fetch_httpx", _fake_httpx)
+    monkeypatch.setattr(SmartHttpFetcher, "_fetch_curl_impersonate", _fake_curl)
+    monkeypatch.setattr("app.collectors.http_fetcher.fetch_via_local_browser", _fake_browser)
+    monkeypatch.setattr("app.collectors.http_fetcher._is_loopback_target", lambda u: False)
+
+    fetcher = SmartHttpFetcher(dict(DEFAULT_SETTINGS))
+    solved = await fetcher.get("https://www.iiss.org/")
+    assert solved.status_code == 200
+    assert solved.via == "browser_cdp"
+    CLEARANCE_CACHE.clear()
 
 
 async def test_wordpress_hidden_feed_and_403_rescue_via_wp_json(waf_server: str):
     collector = WebSiteCollector()
     settings = dict(DEFAULT_SETTINGS)
 
-    # 1. WordPress page without <link type="rss+xml"> automatically discovers /feed/
     batch_wp_feed = await collector.fetch_site_posts(
         site={"canonical_url": f"{waf_server}/fdd-like/"},
         settings=settings,
@@ -181,7 +333,6 @@ async def test_wordpress_hidden_feed_and_403_rescue_via_wp_json(waf_server: str)
     assert batch_wp_feed.discovered_feed_url == f"{waf_server}/fdd-like/feed/"
     assert len(batch_wp_feed.posts) == 3
 
-    # 2. Root site returning 403 on / and /feed/ automatically rescues via /wp-json/wp/v2/posts!
     batch_rescued = await collector.fetch_site_posts(
         site={"canonical_url": f"{waf_server}/"},
         settings=settings,
@@ -189,7 +340,6 @@ async def test_wordpress_hidden_feed_and_403_rescue_via_wp_json(waf_server: str)
     assert batch_rescued.source_mode == "wp_api"
     assert len(batch_rescued.posts) == 1
 
-    # 3. Strict 403 feed endpoint succeeds via Pass 3 feed-header + origin-referer retry
     batch_strict_feed = await collector.fetch_site_posts(
         site={"canonical_url": f"{waf_server}/strict-feed.xml"},
         settings=settings,

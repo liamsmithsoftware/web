@@ -13,6 +13,7 @@ from app.collectors.base import (
     build_httpx_proxy_url,
     build_request_headers,
 )
+from app.collectors.browser_fetcher import CLEARANCE_CACHE, fetch_via_local_browser
 from app.config import DEFAULT_REQUEST_TIMEOUT
 
 try:
@@ -30,7 +31,6 @@ try:
 except Exception:  # pragma: no cover
     HAS_HTTP2 = False
 
-# Modern Chrome-like TLS cipher preference for standard OpenSSL / httpx
 CHROME_LIKE_CIPHERS = (
     "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:"
     "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:"
@@ -39,6 +39,7 @@ CHROME_LIKE_CIPHERS = (
 )
 
 WAF_CHALLENGE_STATUSES = {401, 403, 406, 429, 503}
+CLOUDFLARE_ORIGIN_DOWN_STATUSES = {520, 521, 522, 523, 524, 525, 526}
 
 WAF_BODY_MARKERS = (
     "just a moment...",
@@ -65,10 +66,15 @@ class HttpFetchResponse:
 
     def raise_for_status(self) -> None:
         if self.status_code >= 400:
+            if self.status_code in CLOUDFLARE_ORIGIN_DOWN_STATUSES:
+                raise CollectorError(
+                    f"سرور میزبانی اصلی این وب‌سایت در حال حاضر پاسخ نمی‌دهد یا موقتاً از دسترس خارج است "
+                    f"(خطای سرور مبدأ Cloudflare HTTP {self.status_code}). لطفاً ابتدا باز شدن سایت در مرورگر را بررسی کنید."
+                )
             if self.status_code == 403:
                 raise CollectorError(
                     "سرور وب‌سایت دسترسی را مسدود کرد (HTTP 403 - فایروال/Cloudflare). "
-                    "پیشنهاد: ۱) اگر سایت فیلتر یا محدود به IP است، پروکسی را در تنظیمات فعال کنید؛ "
+                    "پیشنهاد: ۱) اگر VPN شما IP دیتاسنتری دارد، سرور VPN را عوض کنید؛ "
                     "۲) یا کوکی مرورگر (cf_clearance) را در تنظیمات قرار دهید؛ "
                     "۳) یا آدرس مستقیم فید RSS سایت (مثلاً /feed/) را وارد کنید."
                 )
@@ -124,9 +130,11 @@ def resolve_proxy_candidates(
     """
     Returns ordered list of (proxy_url, is_explicit_user_proxy).
     - Never uses a proxy for localhost / 127.0.0.1 targets.
-    - If user explicitly configured a proxy in Settings, uses ONLY that proxy.
-    - Otherwise, if an OS/Windows System Proxy is active, tries the System Proxy
-      first and falls back to direct connection (`None`) if the proxy port is closed.
+    - If user explicitly configured a proxy in Settings, uses it as primary AND keeps
+      direct connection (`None`) as secondary rescue ONLY when the proxy IP itself is
+      blocked by Cloudflare/origin (403 / 520..526).
+    - If an OS/Windows System Proxy is active, tries the System Proxy first and falls
+      back to direct connection (`None`) on network failure or 403/522 block.
     """
     if _is_loopback_target(target_url):
         return [(None, False)]
@@ -176,19 +184,25 @@ def is_waf_challenge(status_code: int, text: str, headers: Dict[str, str]) -> bo
     return False
 
 
+def _merge_cookies(user_cookie: str, cached_cookie: str) -> str:
+    parts = [p.strip() for p in (cached_cookie, user_cookie) if p and p.strip()]
+    return "; ".join(parts)
+
+
 class SmartHttpFetcher:
     """
-    Resilient HTTP GET client designed for public news sites, RSS feeds, and
-    Cloudflare/WAF-protected websites:
-      1) Fast HTTP/2 + Chrome-cipher `httpx` request
-      2) Automatic escalation to `curl_cffi` TLS/JA3/JA4/HTTP2 browser impersonation
-         (`chrome` -> `safari` -> `firefox`, with root cookie warmup) on 403/429/503
-      3) Automatic Windows System Proxy detection with graceful direct fallback
+    4-Layer Resilient HTTP Client:
+      Layer 1: Fast HTTP/2 + Chrome-cipher `httpx` (even across http:// -> https:// redirects)
+      Layer 2: `curl_cffi` TLS/JA3/JA4/HTTP2 browser impersonation (`chrome`/`safari`/`firefox`)
+      Layer 3: Real Headless Browser CDP (`Edge` / `Chrome` installed on Windows/Linux/macOS)
+               to solve Cloudflare JS Managed Challenges + 25-min `cf_clearance` cache
+      Layer 4: Smart Proxy <-> Direct failover when VPN datacenter IP gets 403 or 522
     """
 
-    def __init__(self, settings: Dict[str, str]) -> None:
+    def __init__(self, settings: Dict[str, str], *, allow_browser_fallback: bool = True) -> None:
         self.settings = settings
         self.verify_ssl = settings.get("verify_ssl", "1") != "0"
+        self.allow_browser_fallback = allow_browser_fallback and settings.get("browser_fallback", "1") != "0"
         try:
             t = float(settings.get("request_timeout") or DEFAULT_REQUEST_TIMEOUT)
             self.timeout_sec = max(5.0, min(120.0, t))
@@ -202,31 +216,71 @@ class SmartHttpFetcher:
         accept_kind: str = "document",
         referer: Optional[str] = None,
     ) -> HttpFetchResponse:
-        candidates = resolve_proxy_candidates(self.settings, url)
+        candidates = list(resolve_proxy_candidates(self.settings, url))
+        # Also allow direct rescue if explicit proxy succeeded at TCP level but got 403/522 IP block
+        has_explicit = len(candidates) == 1 and candidates[0][1] is True and candidates[0][0] is not None
+        if has_explicit:
+            candidates.append((None, False))
+
+        primary_resp: Optional[HttpFetchResponse] = None
         last_error: Optional[Exception] = None
 
         for idx, (proxy_url, is_explicit) in enumerate(candidates):
+            is_secondary_direct_rescue = idx > 0 and proxy_url is None
             try:
-                return await self._get_with_proxy(
+                resp = await self._get_with_proxy(
                     url,
                     proxy_url=proxy_url,
                     accept_kind=accept_kind,
                     referer=referer,
+                    fast_timeout=8.0 if is_secondary_direct_rescue else None,
                 )
+                if primary_resp is None:
+                    primary_resp = resp
+
+                # If this route succeeded cleanly, return immediately!
+                if resp.status_code < 400 and not is_waf_challenge(
+                    resp.status_code, resp.text, resp.headers
+                ):
+                    return resp
+
+                # If blocked by WAF (403/429/503) or Cloudflare origin 520..526 via VPN proxy,
+                # try the next route (direct connection) in case the VPN IP was blacklisted!
+                if idx + 1 < len(candidates) and (
+                    is_waf_challenge(resp.status_code, resp.text, resp.headers)
+                    or resp.status_code in CLOUDFLARE_ORIGIN_DOWN_STATUSES
+                ):
+                    continue
+
+                return primary_resp
+
             except (httpx.ProxyError, httpx.ConnectError, httpx.ConnectTimeout) as exc:
                 last_error = exc
-                # If auto-detected OS system proxy failed (e.g. VPN app was closed), fall back to direct
-                if not is_explicit and idx + 1 < len(candidates):
+                # If explicit user proxy itself is unreachable, report immediately so user can fix proxy settings
+                if is_explicit:
+                    self._raise_translated_network_error(exc, url, is_explicit_proxy=True)
+                # If secondary direct rescue timed out (because site is filtered without VPN), return primary_resp!
+                if primary_resp is not None:
+                    return primary_resp
+                if idx + 1 < len(candidates):
                     continue
-                self._raise_translated_network_error(exc, url, is_explicit_proxy=is_explicit)
+                self._raise_translated_network_error(exc, url, is_explicit_proxy=False)
             except CollectorError:
+                if primary_resp is not None:
+                    return primary_resp
                 raise
             except Exception as exc:
                 last_error = exc
-                if not is_explicit and idx + 1 < len(candidates):
+                if is_explicit:
+                    self._raise_translated_network_error(exc, url, is_explicit_proxy=True)
+                if primary_resp is not None:
+                    return primary_resp
+                if idx + 1 < len(candidates):
                     continue
-                self._raise_translated_network_error(exc, url, is_explicit_proxy=is_explicit)
+                self._raise_translated_network_error(exc, url, is_explicit_proxy=False)
 
+        if primary_resp is not None:
+            return primary_resp
         if last_error is not None:
             self._raise_translated_network_error(last_error, url, is_explicit_proxy=False)
         raise CollectorError(f"عدم امکان دریافت آدرس: {url}")
@@ -238,66 +292,100 @@ class SmartHttpFetcher:
         proxy_url: Optional[str],
         accept_kind: str,
         referer: Optional[str],
+        fast_timeout: Optional[float] = None,
     ) -> HttpFetchResponse:
-        httpx_resp: Optional[HttpFetchResponse] = None
+        effective_timeout = fast_timeout or self.timeout_sec
+        best_resp: Optional[HttpFetchResponse] = None
         httpx_exc: Optional[Exception] = None
 
-        # Pass 1: Standard httpx (HTTP/2 enabled for HTTPS when not constrained)
+        # Layer 1: Standard httpx (ALWAYS with HTTP/2 + Chrome ciphers so http:// -> https:// redirects work!)
         try:
             httpx_resp = await self._fetch_httpx(
                 url,
                 proxy_url=proxy_url,
                 accept_kind=accept_kind,
                 referer=referer,
+                timeout_sec=effective_timeout,
             )
+            best_resp = httpx_resp
             if not is_waf_challenge(httpx_resp.status_code, httpx_resp.text, httpx_resp.headers):
                 return httpx_resp
         except (httpx.ProxyError, httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout) as exc:
             httpx_exc = exc
 
-        # Pass 2: Escalate to curl_cffi real browser TLS/HTTP2 impersonation on WAF 403/503 or TLS fingerprint resets
+        # Layer 2: Escalate to curl_cffi real browser TLS/JA3/JA4/HTTP2 impersonation
         if HAS_CURL_CFFI and not _is_loopback_target(url):
-            impersonation_resp = await self._fetch_curl_impersonate(
+            imp_resp = await self._fetch_curl_impersonate(
                 url,
                 proxy_url=proxy_url,
                 accept_kind=accept_kind,
                 referer=referer,
+                timeout_sec=effective_timeout,
             )
-            if impersonation_resp is not None:
-                if (
-                    httpx_resp is None
-                    or impersonation_resp.status_code < 400
-                    or not is_waf_challenge(
-                        impersonation_resp.status_code,
-                        impersonation_resp.text,
-                        impersonation_resp.headers,
-                    )
+            if imp_resp is not None:
+                best_resp = imp_resp
+                if imp_resp.status_code < 400 and not is_waf_challenge(
+                    imp_resp.status_code, imp_resp.text, imp_resp.headers
                 ):
-                    return impersonation_resp
-                httpx_resp = impersonation_resp
+                    return imp_resp
 
-        # Pass 3: If target is a feed/API and document headers hit 403/406, retry with explicit feed headers + origin referer
+        # Layer 3: Feed-header + origin-referer retry for strict RSS endpoints
         if (
-            httpx_resp is not None
-            and httpx_resp.status_code in (403, 406)
+            best_resp is not None
+            and best_resp.status_code in (403, 406)
             and accept_kind != "feed"
         ):
-            parsed = urlparse(url)
+            parsed = urlparse(best_resp.url or url)
             origin_ref = f"{parsed.scheme}://{parsed.netloc}/"
             try:
                 alt_resp = await self._fetch_httpx(
-                    url,
+                    best_resp.url or url,
                     proxy_url=proxy_url,
                     accept_kind="feed",
                     referer=origin_ref,
+                    timeout_sec=effective_timeout,
                 )
-                if alt_resp.status_code < 400:
+                if alt_resp.status_code < 400 and not is_waf_challenge(
+                    alt_resp.status_code, alt_resp.text, alt_resp.headers
+                ):
                     return alt_resp
             except Exception:
                 pass
 
-        if httpx_resp is not None:
-            return httpx_resp
+        # Layer 4: Real Local Browser CDP (Edge / Chrome) for Cloudflare JS Managed Challenges!
+        if (
+            self.allow_browser_fallback
+            and not _is_loopback_target(url)
+            and fast_timeout is None
+            and (
+                best_resp is None
+                or is_waf_challenge(best_resp.status_code, best_resp.text, best_resp.headers)
+            )
+        ):
+            browser_res = await fetch_via_local_browser(
+                best_resp.url if (best_resp and best_resp.url) else url,
+                proxy_url=proxy_url,
+                verify_ssl=self.verify_ssl,
+                custom_cookie=(self.settings.get("custom_cookie") or "").strip(),
+                timeout_sec=max(18.0, self.timeout_sec),
+            )
+            if browser_res is not None:
+                b_resp = HttpFetchResponse(
+                    url=str(browser_res["url"]),
+                    status_code=int(browser_res["status_code"]),
+                    text=str(browser_res["text"]),
+                    headers=dict(browser_res["headers"]),
+                    via=str(browser_res.get("via") or "browser_cdp"),
+                )
+                if b_resp.status_code < 400 and not is_waf_challenge(
+                    b_resp.status_code, b_resp.text, b_resp.headers
+                ):
+                    return b_resp
+                if best_resp is None:
+                    best_resp = b_resp
+
+        if best_resp is not None:
+            return best_resp
         if httpx_exc is not None:
             raise httpx_exc
         raise CollectorError(f"پاسخی از وب‌سایت دریافت نشد ({url}).")
@@ -309,19 +397,29 @@ class SmartHttpFetcher:
         proxy_url: Optional[str],
         accept_kind: str,
         referer: Optional[str],
+        timeout_sec: float,
     ) -> HttpFetchResponse:
+        effective_settings = dict(self.settings)
+        clearance = CLEARANCE_CACHE.get(url, proxy_url)
+        if clearance:
+            if not effective_settings.get("custom_user_agent"):
+                effective_settings["custom_user_agent"] = clearance.user_agent
+            effective_settings["custom_cookie"] = _merge_cookies(
+                effective_settings.get("custom_cookie", ""),
+                clearance.cookie_header,
+            )
+
         headers = build_request_headers(
-            self.settings, referer=referer, accept_kind=accept_kind
+            effective_settings, referer=referer, accept_kind=accept_kind
         )
-        use_h2 = HAS_HTTP2 and url.lower().startswith("https://") and not (
-            proxy_url and proxy_url.startswith("socks")
-        )
-        verify_arg = _build_ssl_context(self.verify_ssl) if url.lower().startswith("https://") else self.verify_ssl
+        # Always enable HTTP/2 and Chrome TLS ciphers (even on http:// URLs that 301-redirect to https://!)
+        use_h2 = HAS_HTTP2 and not (proxy_url and proxy_url.startswith("socks"))
+        verify_arg = _build_ssl_context(self.verify_ssl)
 
         async with httpx.AsyncClient(
             headers=headers,
             follow_redirects=True,
-            timeout=httpx.Timeout(self.timeout_sec, connect=min(15.0, self.timeout_sec)),
+            timeout=httpx.Timeout(timeout_sec, connect=min(12.0, timeout_sec)),
             proxy=proxy_url,
             verify=verify_arg,
             http2=use_h2,
@@ -344,22 +442,32 @@ class SmartHttpFetcher:
         proxy_url: Optional[str],
         accept_kind: str,
         referer: Optional[str],
+        timeout_sec: float,
     ) -> Optional[HttpFetchResponse]:
         if not HAS_CURL_CFFI or CurlAsyncSession is None:
             return None
 
         curl_proxy = _to_curl_proxy(proxy_url)
+        # Upgrade initial http:// to https:// probe candidate only on redirect; let curl follow naturally
         parsed = urlparse(url)
-        origin = f"{parsed.scheme}://{parsed.netloc}/"
+        https_scheme = "https" if parsed.scheme in ("http", "https") else parsed.scheme
+        origin = f"{https_scheme}://{parsed.netloc}/"
         is_subpath = (parsed.path or "/") not in ("", "/")
+
+        clearance = CLEARANCE_CACHE.get(url, proxy_url)
+        user_cookie = (self.settings.get("custom_cookie") or "").strip()
+        merged_cookie = _merge_cookies(
+            user_cookie, clearance.cookie_header if clearance else ""
+        )
 
         extra_headers: Dict[str, str] = {}
         custom_ua = (self.settings.get("custom_user_agent") or "").strip()
         if custom_ua:
             extra_headers["User-Agent"] = custom_ua
-        cookie = (self.settings.get("custom_cookie") or "").strip()
-        if cookie:
-            extra_headers["Cookie"] = cookie
+        elif clearance and clearance.user_agent:
+            extra_headers["User-Agent"] = clearance.user_agent
+        if merged_cookie:
+            extra_headers["Cookie"] = merged_cookie
         if referer:
             extra_headers["Referer"] = referer
         elif is_subpath:
@@ -375,14 +483,13 @@ class SmartHttpFetcher:
                     impersonate=profile,
                     verify=self.verify_ssl,
                     proxy=curl_proxy,
-                    timeout=self.timeout_sec,
+                    timeout=timeout_sec,
                     allow_redirects=True,
-                    max_redirects=8,
+                    max_redirects=10,
                 ) as session:
-                    # Warm session cookies on origin first when requesting a protected subpath (e.g. /feed/ or article)
-                    if is_subpath and profile == "safari":
+                    if is_subpath and profile in ("chrome", "safari") and not clearance:
                         try:
-                            await session.get(origin, timeout=min(10.0, self.timeout_sec))
+                            await session.get(origin, timeout=min(8.0, timeout_sec))
                         except Exception:
                             pass
 
