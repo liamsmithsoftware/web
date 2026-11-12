@@ -219,6 +219,55 @@
                     </div>
                 </div>
 
+                <!-- Sites Filters & Page-Size Bar -->
+                <form id="siteFiltersForm" class="filters-bar sites-filters-bar">
+                    <div class="filter-item filter-search">
+                        <label for="siteFilterSearch">جستجو در نام، دامنه، آدرس یا خطا</label>
+                        <input
+                            id="siteFilterSearch"
+                            type="text"
+                            class="form-control"
+                            placeholder="نام وب‌سایت یا آدرس (مثلاً centcom یا mei.edu)..."
+                        />
+                    </div>
+
+                    <div class="filter-item">
+                        <label for="siteFilterStatus">وضعیت وب‌سایت</label>
+                        <select id="siteFilterStatus" class="form-control">
+                            <option value="all">همه وضعیت‌ها</option>
+                            <option value="ok">فعال و پایش‌شده</option>
+                            <option value="error">دارای خطای دریافت</option>
+                            <option value="pending">در انتظار اولین دریافت</option>
+                            <option value="syncing">در حال دریافت</option>
+                            <option value="inactive">غیرفعال‌شده</option>
+                        </select>
+                    </div>
+
+                    <div class="filter-item">
+                        <label for="siteFilterSource">نوع منبع دریافت</label>
+                        <select id="siteFilterSource" class="form-control">
+                            <option value="all">همه منابع</option>
+                            <option value="has_feed">دارای فید RSS / وب‌سرویس</option>
+                            <option value="no_feed">خزشگر HTML / بدون فید</option>
+                        </select>
+                    </div>
+
+                    <div class="filter-item">
+                        <label for="sitesPageSize">تعداد در هر صفحه</label>
+                        <select id="sitesPageSize" class="form-control">
+                            <option value="10" selected>۱۰ عدد</option>
+                            <option value="20">۲۰ عدد</option>
+                            <option value="30">۳۰ عدد</option>
+                            <option value="all">همه</option>
+                        </select>
+                    </div>
+
+                    <div class="filter-actions">
+                        <button type="submit" class="btn btn-primary">اعمال فیلتر</button>
+                        <button id="btnClearSiteFilters" type="button" class="btn btn-ghost">پاک‌سازی</button>
+                    </div>
+                </form>
+
                 <div class="table-responsive">
                     <table class="data-table">
                         <thead>
@@ -239,6 +288,26 @@
                             </tr>
                         </tbody>
                     </table>
+                </div>
+
+                <!-- Sites Pagination -->
+                <div id="sitesPaginationBar" class="pagination-bar">
+                    <div id="sitesPaginationInfo" class="pagination-info">نمایش ۰ از ۰ وب‌سایت</div>
+                    <div class="pagination-controls">
+                        <div class="page-size-inline">
+                            <label for="sitesPageSizeBottom">تعداد نمایش:</label>
+                            <select id="sitesPageSizeBottom" class="form-control page-size-select">
+                                <option value="10" selected>۱۰</option>
+                                <option value="20">۲۰</option>
+                                <option value="30">۳۰</option>
+                                <option value="all">همه</option>
+                            </select>
+                        </div>
+                        <button id="btnSitesPrevPage" type="button" class="btn btn-outline btn-sm" disabled>صفحه قبل</button>
+                        <div id="sitesPageNumbers" class="page-numbers"></div>
+                        <span id="sitesPageIndicator" class="page-indicator">صفحه ۱ از ۱</span>
+                        <button id="btnSitesNextPage" type="button" class="btn btn-outline btn-sm" disabled>صفحه بعد</button>
+                    </div>
                 </div>
             </div>
         </section>

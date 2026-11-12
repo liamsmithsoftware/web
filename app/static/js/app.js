@@ -8,6 +8,13 @@
 const state = {
     timezone: "Asia/Tehran",
     sites: [],
+    sitesView: {
+        page: 1,
+        pageSize: "10",
+        search: "",
+        status: "all",
+        source: "all",
+    },
     posts: {
         page: 1,
         pageSize: 25,
@@ -294,11 +301,140 @@ function statusBadge(site) {
     return '<span class="badge badge-ok">فعال و پایش‌شده</span>';
 }
 
+function normalizeSearchText(value) {
+    if (value === null || value === undefined) return "";
+    return String(value)
+        .replace(/[۰-۹]/g, (d) => String("۰۱۲۳۴۵۶۷۸۹".indexOf(d)))
+        .replace(/[٠-٩]/g, (d) => String("٠١٢٣٤٥٦٧٨٩".indexOf(d)))
+        .trim()
+        .toLowerCase();
+}
+
+function getFilteredSites() {
+    const { search, status, source } = state.sitesView;
+    const needle = normalizeSearchText(search);
+
+    return state.sites.filter((site) => {
+        if (status && status !== "all") {
+            const isActive = Boolean(site.is_active);
+            const lastStatus = String(site.last_status || "").toLowerCase();
+            if (status === "inactive" && isActive) return false;
+            if (status === "ok" && (!isActive || (lastStatus !== "ok" && lastStatus !== "success"))) {
+                return false;
+            }
+            if (status === "error" && (!isActive || lastStatus !== "error")) return false;
+            if (status === "pending" && (!isActive || lastStatus !== "pending")) return false;
+            if (status === "syncing" && (!isActive || lastStatus !== "syncing")) return false;
+        }
+
+        if (source && source !== "all") {
+            const hasFeed = Boolean(site.feed_url && String(site.feed_url).trim());
+            if (source === "has_feed" && !hasFeed) return false;
+            if (source === "no_feed" && hasFeed) return false;
+        }
+
+        if (needle) {
+            const haystack = [
+                site.title,
+                site.canonical_url,
+                site.domain,
+                site.site_input,
+                site.feed_url,
+                site.last_error,
+            ]
+                .map(normalizeSearchText)
+                .join(" ");
+            if (!haystack.includes(needle)) return false;
+        }
+
+        return true;
+    });
+}
+
+function buildCompactPageList(currentPage, totalPages) {
+    if (totalPages <= 1) return [];
+    if (totalPages <= 7) {
+        return Array.from({ length: totalPages }, (_, idx) => idx + 1);
+    }
+    const pages = new Set([1, totalPages, currentPage, currentPage - 1, currentPage + 1]);
+    const sorted = Array.from(pages)
+        .filter((p) => p >= 1 && p <= totalPages)
+        .sort((a, b) => a - b);
+    const result = [];
+    for (let i = 0; i < sorted.length; i += 1) {
+        if (i > 0 && sorted[i] - sorted[i - 1] > 1) {
+            result.push("...");
+        }
+        result.push(sorted[i]);
+    }
+    return result;
+}
+
+function updateSitesPaginationUI(totalFiltered, totalAll, currentPage, totalPages, startIdx, endIdx) {
+    const info = $("#sitesPaginationInfo");
+    const isFiltered =
+        Boolean(normalizeSearchText(state.sitesView.search)) ||
+        state.sitesView.status !== "all" ||
+        state.sitesView.source !== "all";
+
+    if (info) {
+        if (totalAll === 0) {
+            info.textContent = "نمایش ۰ از ۰ وب‌سایت";
+        } else if (totalFiltered === 0) {
+            info.textContent = `۰ نتیجه مطابق فیلتر (از مجموع ${toFa(totalAll)} وب‌سایت)`;
+        } else if (isFiltered) {
+            info.textContent = `نمایش ${toFa(startIdx + 1)} تا ${toFa(endIdx)} از ${toFa(
+                totalFiltered
+            )} نتیجه فیلتر (کل: ${toFa(totalAll)} وب‌سایت)`;
+        } else {
+            info.textContent = `نمایش ${toFa(startIdx + 1)} تا ${toFa(endIdx)} از مجموع ${toFa(
+                totalAll
+            )} وب‌سایت`;
+        }
+    }
+
+    const indicator = $("#sitesPageIndicator");
+    if (indicator) {
+        indicator.textContent = `صفحه ${toFa(currentPage)} از ${toFa(totalPages)}`;
+    }
+
+    const prevBtn = $("#btnSitesPrevPage");
+    const nextBtn = $("#btnSitesNextPage");
+    if (prevBtn) prevBtn.disabled = currentPage <= 1;
+    if (nextBtn) nextBtn.disabled = currentPage >= totalPages;
+
+    const topSize = $("#sitesPageSize");
+    const bottomSize = $("#sitesPageSizeBottom");
+    if (topSize && topSize.value !== String(state.sitesView.pageSize)) {
+        topSize.value = String(state.sitesView.pageSize);
+    }
+    if (bottomSize && bottomSize.value !== String(state.sitesView.pageSize)) {
+        bottomSize.value = String(state.sitesView.pageSize);
+    }
+
+    const numsContainer = $("#sitesPageNumbers");
+    if (numsContainer) {
+        const items = buildCompactPageList(currentPage, totalPages);
+        numsContainer.innerHTML = items
+            .map((item) => {
+                if (item === "...") {
+                    return '<span class="muted">…</span>';
+                }
+                const activeCls = item === currentPage ? " active" : "";
+                return `<button type="button" class="page-num-btn${activeCls}" data-site-page="${item}">${toFa(
+                    item
+                )}</button>`;
+            })
+            .join("");
+    }
+}
+
 function renderSites() {
     const tbody = $("#sitesTableBody");
     if (!tbody) return;
 
-    if (!state.sites.length) {
+    const totalAll = state.sites.length;
+    if (!totalAll) {
         tbody.innerHTML = `
             <tr>
                 <td colspan="8" class="empty-cell">
@@ -306,10 +442,41 @@ function renderSites() {
                     برای تست سریع بدون اینترنت نیز می‌توانید «بارگذاری داده نمونه آزمایشی» را بزنید.
                 </td>
             </tr>`;
+        updateSitesPaginationUI(0, 0, 1, 1, 0, 0);
         return;
     }
 
-    tbody.innerHTML = state.sites
+    const filtered = getFilteredSites();
+    const totalFiltered = filtered.length;
+
+    if (!totalFiltered) {
+        tbody.innerHTML = `
+            <tr>
+                <td colspan="8" class="empty-cell">
+                    هیچ وب‌سایتی مطابق با فیلتر انتخاب‌شده یافت نشد. می‌توانید دکمه «پاک‌سازی» را بزنید.
+                </td>
+            </tr>`;
+        updateSitesPaginationUI(0, totalAll, 1, 1, 0, 0);
+        return;
+    }
+
+    const rawSize = state.sitesView.pageSize;
+    const isAll = rawSize === "all";
+    const numericSize = isAll ? totalFiltered : Math.max(1, Number(rawSize) || 10);
+    const totalPages = isAll ? 1 : Math.max(1, Math.ceil(totalFiltered / numericSize));
+    if (state.sitesView.page > totalPages) {
+        state.sitesView.page = totalPages;
+    }
+    if (state.sitesView.page < 1) {
+        state.sitesView.page = 1;
+    }
+
+    const currentPage = state.sitesView.page;
+    const startIdx = isAll ? 0 : (currentPage - 1) * numericSize;
+    const endIdx = isAll ? totalFiltered : Math.min(startIdx + numericSize, totalFiltered);
+    const visibleSites = filtered.slice(startIdx, endIdx);
+
+    tbody.innerHTML = visibleSites
         .map((site) => {
             const cursorHtml = !site.initial_sync_done
                 ? '<span class="badge badge-pending">— اولین دریافت انجام نشده —</span>'
@@ -359,6 +526,8 @@ function renderSites() {
             </tr>`;
         })
         .join("");
+
+    updateSitesPaginationUI(totalFiltered, totalAll, currentPage, totalPages, startIdx, endIdx);
 }
 
 async function loadSites() {
@@ -469,6 +638,7 @@ function initSiteForm() {
             $$(".chip").forEach((c) =>
                 c.classList.toggle("active", c.dataset.val === "6" && c.dataset.unit === "hours")
             );
+            state.sitesView.page = 1;
 
             await Promise.all([loadSites(), loadOverview()]);
         } catch (err) {
@@ -585,12 +755,99 @@ async function handleSiteAction(action, siteId, button) {
 
 function initSiteTableEvents() {
     const tbody = $("#sitesTableBody");
-    if (!tbody) return;
-    tbody.addEventListener("click", (event) => {
-        const button = event.target.closest("button[data-action]");
-        if (!button) return;
-        handleSiteAction(button.dataset.action, button.dataset.id, button);
-    });
+    if (tbody) {
+        tbody.addEventListener("click", (event) => {
+            const button = event.target.closest("button[data-action]");
+            if (!button) return;
+            handleSiteAction(button.dataset.action, button.dataset.id, button);
+        });
+    }
+
+    const filterForm = $("#siteFiltersForm");
+    const searchInput = $("#siteFilterSearch");
+    const statusSelect = $("#siteFilterStatus");
+    const sourceSelect = $("#siteFilterSource");
+    const topSizeSelect = $("#sitesPageSize");
+    const bottomSizeSelect = $("#sitesPageSizeBottom");
+    const clearBtn = $("#btnClearSiteFilters");
+    const prevBtn = $("#btnSitesPrevPage");
+    const nextBtn = $("#btnSitesNextPage");
+    const pageNums = $("#sitesPageNumbers");
+
+    const applyFilters = () => {
+        state.sitesView.search = searchInput ? searchInput.value.trim() : "";
+        state.sitesView.status = statusSelect ? statusSelect.value : "all";
+        state.sitesView.source = sourceSelect ? sourceSelect.value : "all";
+        state.sitesView.page = 1;
+        renderSites();
+    };
+
+    if (filterForm) {
+        filterForm.addEventListener("submit", (event) => {
+            event.preventDefault();
+            applyFilters();
+        });
+    }
+    if (searchInput) {
+        searchInput.addEventListener("input", applyFilters);
+    }
+    if (statusSelect) {
+        statusSelect.addEventListener("change", applyFilters);
+    }
+    if (sourceSelect) {
+        sourceSelect.addEventListener("change", applyFilters);
+    }
+
+    const handlePageSizeChange = (newSize) => {
+        state.sitesView.pageSize = newSize || "10";
+        state.sitesView.page = 1;
+        renderSites();
+    };
+    if (topSizeSelect) {
+        topSizeSelect.addEventListener("change", () => handlePageSizeChange(topSizeSelect.value));
+    }
+    if (bottomSizeSelect) {
+        bottomSizeSelect.addEventListener("change", () => handlePageSizeChange(bottomSizeSelect.value));
+    }
+
+    if (clearBtn) {
+        clearBtn.addEventListener("click", () => {
+            if (searchInput) searchInput.value = "";
+            if (statusSelect) statusSelect.value = "all";
+            if (sourceSelect) sourceSelect.value = "all";
+            state.sitesView.search = "";
+            state.sitesView.status = "all";
+            state.sitesView.source = "all";
+            state.sitesView.page = 1;
+            renderSites();
+        });
+    }
+
+    if (prevBtn) {
+        prevBtn.addEventListener("click", () => {
+            if (state.sitesView.page > 1) {
+                state.sitesView.page -= 1;
+                renderSites();
+            }
+        });
+    }
+    if (nextBtn) {
+        nextBtn.addEventListener("click", () => {
+            state.sitesView.page += 1;
+            renderSites();
+        });
+    }
+    if (pageNums) {
+        pageNums.addEventListener("click", (event) => {
+            const btn = event.target.closest("button[data-site-page]");
+            if (!btn) return;
+            const targetPage = Number(btn.dataset.sitePage);
+            if (targetPage >= 1) {
+                state.sitesView.page = targetPage;
+                renderSites();
+            }
+        });
+    }
 }
 
 async function syncAllSites() {

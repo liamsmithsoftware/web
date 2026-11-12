@@ -90,12 +90,113 @@ async def get_overview(request: Request) -> Dict[str, Any]:
 # ------------------------------------------------------------------
 # Websites Management
 # ------------------------------------------------------------------
+def _site_matches_filters(
+    site: Dict[str, Any],
+    *,
+    search: Optional[str] = None,
+    status: Optional[str] = None,
+    source: Optional[str] = None,
+) -> bool:
+    if status and status != "all":
+        st = status.strip().lower()
+        is_active = bool(site.get("is_active"))
+        last_status = str(site.get("last_status") or "").lower()
+        if st == "inactive":
+            if is_active:
+                return False
+        elif st == "ok":
+            if not is_active or last_status not in ("ok", "success"):
+                return False
+        elif st == "error":
+            if not is_active or last_status != "error":
+                return False
+        elif st == "pending":
+            if not is_active or last_status != "pending":
+                return False
+        elif st == "syncing":
+            if not is_active or last_status != "syncing":
+                return False
+
+    if source and source != "all":
+        src = source.strip().lower()
+        has_feed = bool(str(site.get("feed_url") or "").strip())
+        if src == "has_feed" and not has_feed:
+            return False
+        if src == "no_feed" and has_feed:
+            return False
+
+    if search and search.strip():
+        needle = normalize_digits(search).strip().lower()
+        haystack = " ".join(
+            normalize_digits(str(site.get(field) or "")).lower()
+            for field in ("title", "canonical_url", "domain", "site_input", "feed_url", "last_error")
+        )
+        if needle not in haystack:
+            return False
+
+    return True
+
+
 @router.get("/sites")
-async def list_sites(request: Request) -> Dict[str, Any]:
+async def list_sites(
+    request: Request,
+    search: Optional[str] = Query(default=None),
+    status: Optional[str] = Query(default=None),
+    source: Optional[str] = Query(default=None),
+    page: Optional[int] = Query(default=None, ge=1),
+    page_size: Optional[str] = Query(default=None),
+) -> Dict[str, Any]:
     db = _get_db(request)
     tz_name = db.get_settings().get("timezone") or DEFAULT_TIMEZONE
-    items = [_enrich_site(s, tz_name) for s in db.list_sites()]
-    return {"items": items}
+    all_items = [_enrich_site(s, tz_name) for s in db.list_sites()]
+
+    filtered = [
+        s
+        for s in all_items
+        if _site_matches_filters(s, search=search, status=status, source=source)
+    ]
+    total = len(filtered)
+
+    # When neither `page` nor `page_size` is requested, return all matching items (backward-compatible)
+    if page is None and page_size is None:
+        return {
+            "items": filtered,
+            "total": total,
+            "total_all": len(all_items),
+            "page": 1,
+            "page_size": "all",
+            "total_pages": 1,
+        }
+
+    raw_ps = (page_size or "10").strip().lower()
+    if raw_ps == "all":
+        return {
+            "items": filtered,
+            "total": total,
+            "total_all": len(all_items),
+            "page": 1,
+            "page_size": "all",
+            "total_pages": 1,
+        }
+
+    try:
+        ps_num = max(1, min(500, int(normalize_digits(raw_ps))))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="مقدار page_size معتبر نیست.") from exc
+
+    total_pages = max(1, (total + ps_num - 1) // ps_num) if total else 1
+    eff_page = min(page or 1, total_pages)
+    start = (eff_page - 1) * ps_num
+    paged_items = filtered[start : start + ps_num]
+
+    return {
+        "items": paged_items,
+        "total": total,
+        "total_all": len(all_items),
+        "page": eff_page,
+        "page_size": ps_num,
+        "total_pages": total_pages,
+    }
 
 
 @router.post("/sites")
