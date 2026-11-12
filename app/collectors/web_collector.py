@@ -28,6 +28,7 @@ from app.collectors.sitemap_parser import (
 )
 from app.collectors.wp_api_parser import (
     discover_wp_posts_api_url,
+    extract_wp_custom_type_endpoints,
     is_wordpress_html,
     is_wp_posts_json,
     parse_wp_posts_json,
@@ -46,6 +47,7 @@ COMMON_ROOT_FEED_PATHS = (
     "/rss",
     "/feed.xml",
     "/atom.xml",
+    "/feeds/articles",
 )
 
 COMMON_SITEMAP_PATHS = (
@@ -144,6 +146,37 @@ def _resolve_known_public_feeds(url: str) -> List[str]:
 
     if reg_domain == "ipforum.org" and not path_parts:
         return ["https://israelpolicyforum.org/feed/"]
+
+    if reg_domain == "israelpolicyforum.org" and (
+        not path_parts or path_parts == ["feed"]
+    ):
+        return [
+            "https://israelpolicyforum.org/wp-json/wp/v2/posts?per_page=20&_embed=1",
+            "https://israelpolicyforum.org/feed/",
+        ]
+
+    if reg_domain == "lawfaremedia.org" and (
+        not path_parts or path_parts[0] in ("article", "articles", "feeds", "rss.xml", "feed")
+    ):
+        return ["https://www.lawfaremedia.org/feeds/articles"]
+
+    if reg_domain == "chathamhouse.org" and (
+        not path_parts or path_parts[0] in ("rss", "rss.xml", "rss-feeds", "feed")
+    ):
+        return ["https://www.chathamhouse.org/path/whatsnew.xml"]
+
+    if reg_domain == "mei.edu" and (
+        not path_parts or path_parts[0] in ("feed", "rss", "publications", "research")
+    ):
+        return ["https://mei.edu/wp-json/wp/v2/research?per_page=20&_embed=1"]
+
+    if reg_domain == "centcom.mil" and path_parts in (
+        ["media", "news-articles"],
+        ["media", "rss"],
+    ):
+        return [
+            "https://www.centcom.mil/DesktopModules/ArticleCS/RSS.ashx?ContentType=1&Site=808&max=20"
+        ]
 
     return []
 
@@ -406,6 +439,42 @@ class WebSiteCollector:
             return None
         return None
 
+    async def _probe_wp_custom_types(
+        self,
+        fetcher: SmartHttpFetcher,
+        origin_url: str,
+        *,
+        base_url: str,
+        tz_name: str,
+    ) -> Optional[FetchBatchResult]:
+        """
+        When default `/wp-json/wp/v2/posts` returns only placeholder posts (e.g. `mei.edu`
+        `"Hello world!"`) or 404, inspects `/wp-json/wp/v2/types` to discover editorial
+        Custom Post Types (`research`, `publications`, `articles`, `news`).
+        """
+        types_url = urljoin(origin_url.rstrip("/") + "/", "wp-json/wp/v2/types")
+        try:
+            t_resp = await fetcher.get(types_url, accept_kind="json", referer=origin_url)
+        except CollectorError:
+            return None
+        if t_resp.status_code != 200 or not t_resp.text:
+            return None
+
+        cpt_endpoints = extract_wp_custom_type_endpoints(t_resp.text, origin_url)
+        for cpt_ep in cpt_endpoints:
+            try:
+                c_resp = await fetcher.get(cpt_ep, accept_kind="json", referer=origin_url)
+                if _is_sso_login_wall(c_resp, cpt_ep):
+                    continue
+                parsed = await self._try_parse_feed_or_wp_response(
+                    c_resp, base_url=base_url, tz_name=tz_name
+                )
+                if parsed is not None:
+                    return parsed
+            except CollectorError:
+                continue
+        return None
+
     async def _probe_candidate_endpoints(
         self,
         fetcher: SmartHttpFetcher,
@@ -414,8 +483,9 @@ class WebSiteCollector:
         base_url: str,
         tz_name: str,
     ) -> Optional[FetchBatchResult]:
-        origin = _origin_of(base_url)
+        origin = _origin_of(_https_upgrade_candidate(base_url) or base_url)
         seen = set()
+        tried_cpt_origins = set()
         for candidate in candidates:
             if not candidate or candidate in seen:
                 continue
@@ -430,6 +500,17 @@ class WebSiteCollector:
                 )
                 if parsed is not None:
                     return parsed
+
+                # If `/wp-json/wp/v2/posts` returned only placeholder posts or 404, check WP Custom Post Types
+                if "/wp/v2/posts" in candidate:
+                    cand_origin = _origin_of(resp.url or candidate)
+                    if cand_origin not in tried_cpt_origins:
+                        tried_cpt_origins.add(cand_origin)
+                        cpt_res = await self._probe_wp_custom_types(
+                            fetcher, cand_origin, base_url=base_url, tz_name=tz_name
+                        )
+                        if cpt_res is not None:
+                            return cpt_res
             except CollectorError:
                 continue
         return None
@@ -468,7 +549,11 @@ class WebSiteCollector:
                 )
 
             # <sitemapindex> -> inspect prioritized news/post child sitemaps
-            for child_url in extract_child_sitemaps(resp.text, max_items=3):
+            for child_url in extract_child_sitemaps(
+                resp.text,
+                max_items=4,
+                prefer_https=preferred_base.startswith("https://"),
+            ):
                 try:
                     c_resp = await fast_fetcher.get(child_url, referer=origin)
                 except CollectorError:
@@ -491,6 +576,7 @@ class WebSiteCollector:
         preferred = _https_upgrade_candidate(url) or url
         endpoints: List[str] = []
         base_slash = preferred.rstrip("/") + "/"
+        reg_domain = extract_registrable_domain(urlparse(preferred).hostname or "")
         if is_root:
             endpoints.append(urljoin(base_slash, "feed/"))
             origin = _origin_of(preferred)
@@ -499,6 +585,10 @@ class WebSiteCollector:
                 ep = urljoin(base_slash, suffix.lstrip("/"))
                 if ep not in endpoints:
                     endpoints.append(ep)
+            if reg_domain == "centcom.mil":
+                endpoints.append(
+                    "https://www.centcom.mil/DesktopModules/ArticleCS/RSS.ashx?ContentType=1&Site=808&max=20"
+                )
         else:
             endpoints.append(urljoin(base_slash, "feed/"))
             endpoints.append(urljoin(base_slash, "rss"))
@@ -609,8 +699,13 @@ class WebSiteCollector:
         tz_name: str,
     ) -> FetchBatchResult:
         if known_feed_url:
+            direct_cands = [known_feed_url]
+            if not known_feed_url.endswith("/") and not known_feed_url.lower().endswith(
+                (".xml", ".rss", ".atom", ".rdf", ".jsonfeed", ".ashx")
+            ):
+                direct_cands.append(known_feed_url + "/")
             res = await self._probe_candidate_endpoints(
-                fetcher, [known_feed_url], base_url=canonical_url, tz_name=tz_name
+                fetcher, direct_cands, base_url=canonical_url, tz_name=tz_name
             )
             if res is not None:
                 return res
@@ -676,21 +771,75 @@ class WebSiteCollector:
         _allow_sso_portal_rescue: bool = True,
     ) -> FetchBatchResult:
         # 1. Try previously discovered feed/API endpoint or explicit feed URL first
-        if known_feed_url or looks_like_feed_url(canonical_url) or "/wp-json/" in canonical_url:
+        is_explicit_feed = looks_like_feed_url(canonical_url) or "/wp-json/" in canonical_url
+        if known_feed_url or is_explicit_feed:
             target = known_feed_url or canonical_url
             accept_kind = "json" if "/wp-json/" in target else "document"
+            origin_ref = _origin_of(_https_upgrade_candidate(canonical_url) or canonical_url)
             resp = await self._get_with_https_upgrade(
-                fetcher, target, accept_kind=accept_kind, referer=_origin_of(canonical_url)
+                fetcher, target, accept_kind=accept_kind, referer=origin_ref
             )
             direct = await self._try_parse_feed_or_wp_response(
                 resp, base_url=canonical_url, tz_name=tz_name
             )
             if direct is not None:
                 return direct
-            if (looks_like_feed_url(canonical_url) or "/wp-json/" in canonical_url) and not known_feed_url:
+
+            # Retry with trailing slash if `parse_site_input` stripped `/feed/` -> `/feed`
+            t_path = (urlparse(target).path or "").lower()
+            if (
+                not target.endswith("/")
+                and "/wp-json/" not in target
+                and not t_path.endswith((".xml", ".rss", ".atom", ".rdf", ".jsonfeed", ".ashx"))
+            ):
+                slash_resp = await self._get_with_https_upgrade(
+                    fetcher, target + "/", accept_kind=accept_kind, referer=origin_ref
+                )
+                slash_direct = await self._try_parse_feed_or_wp_response(
+                    slash_resp, base_url=canonical_url, tz_name=tz_name
+                )
+                if slash_direct is not None:
+                    return slash_direct
+
+            # If `/rss.xml` redirected to an HTML feed guide (e.g. `chathamhouse.org/rss-feeds`),
+            # follow XML feed links advertised on that page
+            if resp.status_code == 200 and resp.text:
+                dir_feeds = discover_feed_urls_in_html(
+                    resp.text, resp.url or target, section_strict=False
+                )
+                if dir_feeds:
+                    dir_res = await self._probe_candidate_endpoints(
+                        fetcher, dir_feeds[:4], base_url=origin_ref, tz_name=tz_name
+                    )
+                    if dir_res is not None:
+                        return dir_res
+
+            # Rescue explicit `/feed` or `/rss` URLs (e.g. `https://israelpolicyforum.org/feed` 403
+            # or `mei.edu/feed` placeholder) via known feeds, parent `/wp-json/`, or root homepage!
+            if is_explicit_feed:
+                fast_probe = SmartHttpFetcher(fetcher.settings, allow_browser_fallback=False)
+                rescue_eps: List[str] = []
+                for ep in _resolve_known_public_feeds(canonical_url) + _resolve_known_public_feeds(origin_ref):
+                    if ep not in rescue_eps:
+                        rescue_eps.append(ep)
+                for ep in self._build_blind_fallback_endpoints(origin_ref, is_root=True):
+                    if ep not in rescue_eps:
+                        rescue_eps.append(ep)
+                rescued_feed = await self._probe_candidate_endpoints(
+                    fast_probe, rescue_eps, base_url=origin_ref, tz_name=tz_name
+                )
+                if rescued_feed is not None:
+                    return rescued_feed
+                if origin_ref.rstrip("/") != (_https_upgrade_candidate(canonical_url) or canonical_url).rstrip("/"):
+                    try:
+                        return await self._fetch_via_auto(
+                            fetcher, origin_ref, None, tz_name, _allow_sso_portal_rescue=False
+                        )
+                    except CollectorError:
+                        pass
                 resp.raise_for_status()
 
-        # 1b. Known official external feeds (wsj.com, war.gov, ipforum.org)
+        # 1b. Known official external feeds (wsj.com, war.gov, lawfaremedia.org, chathamhouse.org, mei.edu)
         public_feeds = _resolve_known_public_feeds(canonical_url)
         if public_feeds:
             fast_probe = SmartHttpFetcher(fetcher.settings, allow_browser_fallback=False)

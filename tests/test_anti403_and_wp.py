@@ -1294,4 +1294,248 @@ async def test_bicom_wp_json_fallback_and_turnstile_backend_node_clicker(monkeyp
     assert entry.cdp_cookies[0]["domain"] == ".criticalthreats.org"
 
 
+async def test_mil_remote_protocol_error_recovery_registrable_domains_and_centcom(monkeypatch):
+    import httpx
+
+    assert extract_registrable_domain("https://www.afcent.af.mil/News") == "afcent.af.mil"
+    assert extract_registrable_domain("https://www.cusnc.navy.mil/") == "cusnc.navy.mil"
+    assert extract_registrable_domain("https://www.centcom.mil/") == "centcom.mil"
+
+    centcom_html = """<!DOCTYPE html>
+    <html><head><title>U.S. Central Command</title></head><body>
+        <main>
+            <div class="release-item">
+                <h3><a href="https://www.centcom.mil/MEDIA/PUBLIC-RELEASES/Article/4644120/centcom-forces-defend-regional-shipping-lanes/">
+                    CENTCOM Forces Defend Regional Shipping Lanes
+                </a></h3>
+                <p>TAMPA, Fla. – U.S. Central Command forces conducted maritime security operations on Nov. 7, 2026.</p>
+            </div>
+            <div class="gallery-popup">
+                <a href="https://www.centcom.mil/MEDIA/IMAGERY/igphoto/2004024001/">Photo 2004024001 Slide</a>
+            </div>
+        </main>
+    </body></html>"""
+
+    cusnc_html = """<!DOCTYPE html>
+    <html><head><title>U.S. Naval Forces Central Command</title></head><body>
+        <main>
+            <article>
+                <h3><a href="https://www.cusnc.navy.mil/Media/News/Display/Article/4638901/navcent-concludes-joint-maritime-exercise/">
+                    NAVCENT Concludes Joint Maritime Exercise in Arabian Gulf
+                </a></h3>
+                <span>Nov. 1, 2026</span>
+            </article>
+        </main>
+    </body></html>"""
+
+    # Simulate Akamai HTTP/2 `RemoteProtocolError` in `httpx` -> seamless recovery via Layer 2 `curl_cffi`!
+    async def _boom_httpx(self, url, **kwargs):
+        raise httpx.RemoteProtocolError("Server disconnected without sending a response (PROTOCOL_ERROR)")
+
+    async def _ok_curl(self, url, **kwargs):
+        if "cusnc.navy.mil" in url:
+            return HttpFetchResponse(
+                url="https://www.cusnc.navy.mil/",
+                status_code=200,
+                text=cusnc_html,
+                headers={"content-type": "text/html; charset=utf-8"},
+                via="curl_cffi:chrome",
+            )
+        return HttpFetchResponse(
+            url="https://www.centcom.mil/",
+            status_code=200,
+            text=centcom_html,
+            headers={"content-type": "text/html; charset=utf-8"},
+            via="curl_cffi:chrome",
+        )
+
+    monkeypatch.setattr("app.collectors.http_fetcher.HAS_CURL_CFFI", True)
+    monkeypatch.setattr(SmartHttpFetcher, "_fetch_httpx", _boom_httpx)
+    monkeypatch.setattr(SmartHttpFetcher, "_fetch_curl_impersonate", _ok_curl)
+
+    collector = WebSiteCollector()
+    centcom_batch = await collector.fetch_site_posts(
+        site={"canonical_url": "https://www.centcom.mil/"},
+        settings={**DEFAULT_SETTINGS, "browser_fallback": "0"},
+    )
+    assert centcom_batch.source_mode == "html"
+    assert len(centcom_batch.posts) == 1
+    assert "Shipping Lanes" in centcom_batch.posts[0].title
+    # Ensure `igphoto` gallery popups were excluded
+    assert all("igphoto" not in p.post_url for p in centcom_batch.posts)
+
+    cusnc_batch = await collector.fetch_site_posts(
+        site={"canonical_url": "https://www.cusnc.navy.mil/"},
+        settings={**DEFAULT_SETTINGS, "browser_fallback": "0"},
+    )
+    assert len(cusnc_batch.posts) == 1
+    assert "NAVCENT" in cusnc_batch.posts[0].title
+
+
+async def test_mei_acf_research_cpt_and_overlay_card_fallback(monkeypatch):
+    mei_research_json = json.dumps(
+        [
+            {
+                "id": 61663,
+                "date": "2026-11-11T09:42:03",
+                "date_gmt": "2026-11-11T14:42:03",
+                "guid": {"rendered": "https://mei.edu/?post_type=research&p=61663"},
+                "link": "https://mei.edu/publication/trumps-midterm-loss-opens-a-window-for-iran-diplomacy/",
+                "title": {"rendered": "Trump&#8217;s Midterm Loss Opens a Window for Iran Diplomacy"},
+                "acf": {
+                    "details": {
+                        "abstract": "Eight months after launching the war, Washington faces key diplomatic choices."
+                    },
+                    "page_layout": [
+                        {
+                            "acf_fc_layout": "layout_wysiwyg",
+                            "component_wysiwyg": {
+                                "content": (
+                                    "Eight months after launching the war, Washington faces key diplomatic choices.\r\n\r\n"
+                                    "Regional mediators in Muscat and Doha are renewing diplomatic outreach.\r\n\r\n"
+                                    '[tm_button url="https://en.majalla.com/node/334101" label="Read More in Al Majalla" target="true"]'
+                                )
+                            },
+                        }
+                    ],
+                },
+                "yoast_head": (
+                    '<meta property="og:site_name" content="Middle East Institute" />'
+                    '<meta property="og:image" content="https://mei.edu/wp-content/uploads/2026/11/cover.jpg" />'
+                ),
+            }
+        ]
+    )
+
+    async def _mock_get(self, url, **kwargs):
+        if "mei.edu/wp-json/wp/v2/research" in url:
+            return HttpFetchResponse(
+                url=url,
+                status_code=200,
+                text=mei_research_json,
+                headers={"content-type": "application/json"},
+            )
+        return HttpFetchResponse(url=url, status_code=403, text="Just a moment...", headers={})
+
+    monkeypatch.setattr(SmartHttpFetcher, "get", _mock_get)
+    collector = WebSiteCollector()
+    batch = await collector.fetch_site_posts(
+        site={"canonical_url": "http://www.mei.edu/"},
+        settings=dict(DEFAULT_SETTINGS),
+    )
+    assert batch.source_mode == "wp_api"
+    assert batch.site_title == "Middle East Institute"
+    assert len(batch.posts) == 1
+    assert "Iran Diplomacy" in batch.posts[0].title
+    assert "Regional mediators in Muscat" in batch.posts[0].content
+    assert "[tm_button" not in batch.posts[0].content
+    assert batch.posts[0].media_url == "https://mei.edu/wp-content/uploads/2026/11/cover.jpg"
+
+
+async def test_washington_institute_paginated_sitemap_selects_highest_page_and_english_urls(monkeypatch):
+    wi_sitemap_index = """<?xml version="1.0" encoding="UTF-8"?>
+    <sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+        <sitemap><loc>http://www.washingtoninstitute.org/sitemap.xml?page=1</loc><lastmod>2026-11-11T00:36:53-05:00</lastmod></sitemap>
+        <sitemap><loc>http://www.washingtoninstitute.org/sitemap.xml?page=2</loc><lastmod>2026-11-11T00:36:53-05:00</lastmod></sitemap>
+        <sitemap><loc>http://www.washingtoninstitute.org/sitemap.xml?page=12</loc><lastmod>2026-11-11T00:36:53-05:00</lastmod></sitemap>
+    </sitemapindex>"""
+
+    children = extract_child_sitemaps(wi_sitemap_index, max_items=2, prefer_https=True)
+    assert children[0] == "https://www.washingtoninstitute.org/sitemap.xml?page=12"
+
+    page12_xml = """<?xml version="1.0" encoding="UTF-8"?>
+    <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+        <url><loc>http://www.washingtoninstitute.org/policy-analysis/item-one-maritime-security</loc><lastmod>2026-11-09T12:00:00-05:00</lastmod></url>
+        <url><loc>http://www.washingtoninstitute.org/ar/policy-analysis/alitem-one-arabic-slug</loc><lastmod>2026-11-09T12:00:00-05:00</lastmod></url>
+        <url><loc>http://www.washingtoninstitute.org/policy-analysis/item-two-energy-corridors</loc><lastmod>2026-11-08T12:00:00-05:00</lastmod></url>
+        <url><loc>http://www.washingtoninstitute.org/policy-analysis/item-three-regional-deterrence</loc><lastmod>2026-11-07T12:00:00-05:00</lastmod></url>
+        <url><loc>http://www.washingtoninstitute.org/policy-analysis/item-four-diplomatic-options</loc><lastmod>2026-11-06T12:00:00-05:00</lastmod></url>
+        <url><loc>http://www.washingtoninstitute.org/policy-analysis/item-five-red-sea-shipping</loc><lastmod>2026-11-05T12:00:00-05:00</lastmod></url>
+    </urlset>"""
+
+    async def _mock_get(self, url, **kwargs):
+        if url.endswith("sitemap.xml"):
+            return HttpFetchResponse(url=url, status_code=200, text=wi_sitemap_index, headers={"content-type": "application/xml"})
+        if "sitemap.xml?page=12" in url:
+            return HttpFetchResponse(url=url, status_code=200, text=page12_xml, headers={"content-type": "application/xml"})
+        return HttpFetchResponse(url=url, status_code=403, text="<html><title>Just a moment...</title></html>", headers={})
+
+    monkeypatch.setattr(SmartHttpFetcher, "get", _mock_get)
+    collector = WebSiteCollector()
+    batch = await collector.fetch_site_posts(
+        site={"canonical_url": "http://www.washingtoninstitute.org/"},
+        settings=dict(DEFAULT_SETTINGS),
+    )
+    assert batch.source_mode == "sitemap"
+    assert len(batch.posts) == 5
+    assert all("/ar/" not in p.post_url for p in batch.posts)
+
+
+async def test_israel_policy_forum_slashless_feed_rescue_and_vc_shortcode_stripping(monkeypatch):
+    ipf_wp_json = json.dumps(
+        [
+            {
+                "id": 112064,
+                "date": "2026-11-05T12:50:44",
+                "date_gmt": "2026-11-05T17:50:44",
+                "guid": {"rendered": "https://israelpolicyforum.org/?p=112064"},
+                "link": "https://israelpolicyforum.org/2026/11/05/three-unknowns-to-watch-in-the-blue-tsunamis-wake/",
+                "title": {"rendered": "Three Unknowns to Watch in the Blue Tsunami&#8217;s Wake"},
+                "content": {
+                    "rendered": (
+                        '[vc_row row_height_percent="0"][vc_column][vc_raw_html]JTNDaWZyYW1lJTNF[/vc_raw_html]'
+                        '[vc_column_text]<p>Democratic control of both the House and Senate is going to bring real changes.</p>'
+                        "[/vc_column_text][/vc_row]"
+                    )
+                },
+            }
+        ]
+    )
+
+    async def _mock_get(self, url, **kwargs):
+        if "wp-json/wp/v2/posts" in url:
+            return HttpFetchResponse(
+                url=url, status_code=200, text=ipf_wp_json, headers={"content-type": "application/json"}
+            )
+        return HttpFetchResponse(
+            url=url, status_code=403, text="<html><title>Just a moment...</title></html>", headers={}
+        )
+
+    monkeypatch.setattr(SmartHttpFetcher, "get", _mock_get)
+    collector = WebSiteCollector()
+
+    # Both `https://israelpolicyforum.org/feed` (with `feed_url` set!) and root `/` succeed cleanly
+    feed_batch = await collector.fetch_site_posts(
+        site={
+            "canonical_url": "https://israelpolicyforum.org/feed",
+            "feed_url": "https://israelpolicyforum.org/feed",
+        },
+        settings=dict(DEFAULT_SETTINGS),
+    )
+    assert feed_batch.source_mode == "wp_api"
+    assert len(feed_batch.posts) == 1
+    assert "[vc_row" not in feed_batch.posts[0].content
+    assert "JTNDaWZyYW1l" not in feed_batch.posts[0].content
+    assert "Democratic control of both the House and Senate" in feed_batch.posts[0].content
+
+
+async def test_lawfare_chathamhouse_feeds_and_authenticated_http_proxy_cdp(monkeypatch):
+    from app.collectors.browser_fetcher import _split_chromium_proxy_and_auth
+    from app.collectors.web_collector import _resolve_known_public_feeds
+
+    assert _resolve_known_public_feeds("https://www.lawfaremedia.org/") == [
+        "https://www.lawfaremedia.org/feeds/articles"
+    ]
+    assert _resolve_known_public_feeds("https://www.chathamhouse.org/") == [
+        "https://www.chathamhouse.org/path/whatsnew.xml"
+    ]
+
+    # Authenticated HTTP proxy splits cleanly for Chrome CLI + CDP Fetch.authRequired
+    srv, auth, ok = _split_chromium_proxy_and_auth("http://alice:s3cr3t@127.0.0.1:8080")
+    assert ok is True
+    assert srv == "http://127.0.0.1:8080"
+    assert auth == ("alice", "s3cr3t")
+
+
+
 

@@ -22,6 +22,140 @@ OG_IMAGE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Page-builder shortcodes (WPBakery/Uncode `[vc_*]`, Divi `[et_pb_*]`, Avada `[fusion_*]`, MEI `[tm_*]`)
+WP_RAW_BLOCK_SHORTCODE_RE = re.compile(
+    r"\[(?:vc_raw_html|vc_raw_js|et_pb_code)[^\]]*\].*?\[/(?:vc_raw_html|vc_raw_js|et_pb_code)\]",
+    re.IGNORECASE | re.DOTALL,
+)
+WP_SHORTCODE_TAG_RE = re.compile(
+    r"\[/?(?:vc_[a-z0-9_]+|et_pb_[a-z0-9_]+|fusion_[a-z0-9_]+|avia_[a-z0-9_]+|tm_[a-z0-9_]+|uncode_[a-z0-9_]+)"
+    r"(?:\s[^\]]*)?\]",
+    re.IGNORECASE,
+)
+
+BUILTIN_NON_EDITORIAL_WP_TYPES = {
+    "post",
+    "posts",
+    "page",
+    "pages",
+    "attachment",
+    "media",
+    "nav_menu_item",
+    "menu-items",
+    "wp_block",
+    "blocks",
+    "wp_template",
+    "templates",
+    "wp_template_part",
+    "template-parts",
+    "wp_global_styles",
+    "global-styles",
+    "wp_navigation",
+    "navigation",
+    "wp_font_family",
+    "font-families",
+    "wp_font_face",
+    "font-faces",
+    "person",
+    "people",
+    "staff",
+    "expert",
+    "experts",
+    "author",
+    "authors",
+    "team",
+    "event",
+    "events",
+    "project",
+    "projects",
+    "exhibition",
+    "exhibitions",
+}
+
+EDITORIAL_CPT_PRIORITY_TOKENS = (
+    "research",
+    "publication",
+    "article",
+    "news",
+    "analysis",
+    "report",
+    "commentary",
+    "policy",
+    "brief",
+    "insight",
+    "press",
+    "podcast",
+)
+
+
+def strip_wp_shortcodes(raw_html: str) -> str:
+    """Removes WPBakery/Uncode/Divi/Avada shortcodes while preserving inner prose paragraphs."""
+    if not raw_html or "[" not in raw_html:
+        return raw_html or ""
+    cleaned = WP_RAW_BLOCK_SHORTCODE_RE.sub(" ", raw_html)
+    cleaned = WP_SHORTCODE_TAG_RE.sub(" ", cleaned)
+    return cleaned
+
+
+def extract_wp_custom_type_endpoints(types_json_text: str, base_url: str) -> List[str]:
+    """
+    Parses `/wp-json/wp/v2/types` and returns prioritized editorial Custom Post Type
+    collection URLs (e.g. `https://mei.edu/wp-json/wp/v2/research?per_page=20&_embed=1`)
+    when a WordPress site stores articles outside default `posts`.
+    """
+    try:
+        data = json.loads(types_json_text or "")
+    except Exception:
+        return []
+    if not isinstance(data, dict):
+        return []
+
+    parsed_base = urlparse(base_url)
+    origin = f"{parsed_base.scheme}://{parsed_base.netloc}" if parsed_base.scheme and parsed_base.netloc else ""
+    scored: List[Tuple[int, str]] = []
+
+    for slug, info in data.items():
+        if not isinstance(info, dict):
+            continue
+        slug_low = str(slug or "").strip().lower()
+        rest_base = str(info.get("rest_base") or slug_low).strip().strip("/")
+        rest_ns = str(info.get("rest_namespace") or "wp/v2").strip().strip("/")
+        if not rest_base:
+            continue
+        if slug_low in BUILTIN_NON_EDITORIAL_WP_TYPES or rest_base.lower() in BUILTIN_NON_EDITORIAL_WP_TYPES:
+            continue
+
+        href = ""
+        links = info.get("_links")
+        if isinstance(links, dict):
+            wp_items = links.get("wp:items")
+            if isinstance(wp_items, list) and wp_items and isinstance(wp_items[0], dict):
+                href = str(wp_items[0].get("href") or "").strip()
+        if not href and origin:
+            href = f"{origin}/wp-json/{rest_ns}/{rest_base}"
+        if not href:
+            continue
+
+        combined_label = f"{slug_low} {rest_base.lower()} {str(info.get('name') or '').lower()}"
+        rank = 50
+        for idx, tok in enumerate(EDITORIAL_CPT_PRIORITY_TOKENS):
+            if tok in combined_label:
+                rank = idx
+                break
+
+        sep = "&" if "?" in href else "?"
+        ep = f"{href}{sep}per_page=20&_embed=1"
+        scored.append((rank, ep))
+
+    scored.sort(key=lambda pair: pair[0])
+    seen = set()
+    result: List[str] = []
+    for _, ep in scored:
+        if ep not in seen:
+            seen.add(ep)
+            result.append(ep)
+    return result[:4]
+
 
 def is_wordpress_html(html: str) -> bool:
     head = (html or "")[:25000].lower()
@@ -149,12 +283,53 @@ def _extract_wp_media_and_site_title(
     return media_url, site_title
 
 
+def _extract_acf_rich_html(item: Dict[str, Any]) -> str:
+    """
+    Extracts article body/abstract HTML stored in Advanced Custom Fields (`acf`) on
+    headless/custom WordPress sites such as Middle East Institute (`mei.edu/wp-json/wp/v2/research`).
+    """
+    acf = item.get("acf")
+    if not isinstance(acf, dict):
+        return ""
+
+    chunks: List[str] = []
+    details = acf.get("details")
+    if isinstance(details, dict):
+        abstract = str(details.get("abstract") or details.get("summary") or "").strip()
+        if abstract:
+            chunks.append(f"<p>{abstract}</p>")
+
+    page_layout = acf.get("page_layout")
+    if isinstance(page_layout, list):
+        for block in page_layout:
+            if not isinstance(block, dict):
+                continue
+            for val in block.values():
+                if isinstance(val, dict):
+                    wysiwyg = str(val.get("content") or val.get("text") or val.get("body") or "").strip()
+                    if len(wysiwyg) >= 25:
+                        chunks.append(wysiwyg)
+                elif isinstance(val, str) and len(val.strip()) >= 80:
+                    chunks.append(val.strip())
+
+    for key in ("content", "body", "article_body", "abstract", "summary", "description"):
+        top_val = acf.get(key)
+        if isinstance(top_val, str) and len(top_val.strip()) >= 25:
+            chunks.append(top_val.strip())
+
+    # Deduplicate identical paragraphs (e.g. when `abstract` repeats paragraph 1 of `component_wysiwyg`)
+    if len(chunks) >= 2 and chunks[0].strip("<p></p> ")[:80] in chunks[1]:
+        chunks = chunks[1:]
+
+    return "\n\n".join(chunks)
+
+
 def parse_wp_posts_json(
     raw_text: str,
     base_url: str,
     tz_name: str = "Asia/Tehran",
 ) -> Tuple[Optional[str], List[FetchedPost]]:
-    """Parses WordPress REST API `/wp-json/wp/v2/posts` JSON array into FetchedPost items."""
+    """Parses WordPress REST API `/wp-json/wp/v2/posts` (or CPT) JSON array into FetchedPost items."""
     try:
         items = json.loads(raw_text)
     except Exception as exc:
@@ -188,18 +363,18 @@ def parse_wp_posts_json(
 
         title_obj = item.get("title")
         raw_title = title_obj.get("rendered", "") if isinstance(title_obj, dict) else str(title_obj or "")
-        title = _strip_tags_inline(str(raw_title))
+        title = _strip_tags_inline(strip_wp_shortcodes(str(raw_title)))
 
         content_obj = item.get("content")
         raw_content = content_obj.get("rendered", "") if isinstance(content_obj, dict) else ""
         excerpt_obj = item.get("excerpt")
         raw_excerpt = excerpt_obj.get("rendered", "") if isinstance(excerpt_obj, dict) else ""
+        acf_html = _extract_acf_rich_html(item) if not str(raw_content or "").strip() else ""
 
-        body_text, inline_media_url, inline_media_type = html_fragment_to_text(
-            str(raw_content or raw_excerpt or "")
-        )
+        primary_html = strip_wp_shortcodes(str(raw_content or acf_html or raw_excerpt or ""))
+        body_text, inline_media_url, inline_media_type = html_fragment_to_text(primary_html)
         if not body_text and raw_excerpt:
-            body_text, _, _ = html_fragment_to_text(str(raw_excerpt))
+            body_text, _, _ = html_fragment_to_text(strip_wp_shortcodes(str(raw_excerpt)))
 
         feat_media_url, item_site_title = _extract_wp_media_and_site_title(item, post_url)
         if item_site_title and not detected_site_title:

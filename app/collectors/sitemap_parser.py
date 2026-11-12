@@ -28,8 +28,17 @@ def is_sitemap_xml(text: str, content_type: str = "") -> bool:
     return "<urlset" in head or "<sitemapindex" in head
 
 
-def extract_child_sitemaps(text: str, *, max_items: int = 4) -> List[str]:
-    """If sitemap.xml is a <sitemapindex>, prioritize post/news/article child sitemaps."""
+def extract_child_sitemaps(
+    text: str,
+    *,
+    max_items: int = 4,
+    prefer_https: bool = False,
+) -> List[str]:
+    """
+    If sitemap.xml is a `<sitemapindex>`, prioritize news/post/article/research child sitemaps
+    AND sort paginated chunks (e.g. Drupal `sitemap.xml?page=12` or Yoast `research-sitemap9.xml`)
+    by newest `<lastmod>` and highest chunk number first.
+    """
     cleaned = XML_CTRL_RE.sub("", (text or "").lstrip("\ufeff").strip())
     try:
         root = ET.fromstring(cleaned)
@@ -38,28 +47,56 @@ def extract_child_sitemaps(text: str, *, max_items: int = 4) -> List[str]:
     if _local_name(root.tag) != "sitemapindex":
         return []
 
-    locs: List[str] = []
+    entries: List[Tuple[str, float]] = []
     for sm in root:
         if _local_name(sm.tag) != "sitemap":
             continue
+        loc = ""
+        lastmod_ts = 0.0
         for child in sm:
-            if _local_name(child.tag) == "loc":
+            cname = _local_name(child.tag)
+            if cname == "loc":
                 loc = "".join(child.itertext()).strip()
-                if loc.startswith(("http://", "https://")) and not loc.endswith(".gz"):
-                    locs.append(loc)
+            elif cname == "lastmod":
+                dt = parse_any_datetime("".join(child.itertext()).strip(), tz_name="UTC")
+                if dt is not None:
+                    lastmod_ts = dt.timestamp()
+        if loc.startswith(("http://", "https://")) and not loc.endswith(".gz"):
+            if prefer_https and loc.startswith("http://"):
+                loc = "https://" + loc[len("http://") :]
+            entries.append((loc, lastmod_ts))
 
-    def _priority(u: str) -> int:
-        low = u.lower()
-        if "news" in low:
-            return 0
-        if "post" in low or "article" in low or "analysis" in low:
-            return 1
-        if "page" in low or "category" in low or "tag" in low or "author" in low:
-            return 9
-        return 5
+    low_priority_re = re.compile(
+        r"(?:^|/|-|_)(?:page-sitemap|pages-sitemap|category|categories|tag|tags|"
+        r"author|authors|person|people|topic|topics|region|regions|project|projects|exhibition)",
+        re.IGNORECASE,
+    )
+    high_news_re = re.compile(r"(?:news|breaking)", re.IGNORECASE)
+    editorial_re = re.compile(
+        r"(?:post|article|analysis|research|publication|report|press|commentary)",
+        re.IGNORECASE,
+    )
+    chunk_num_re = re.compile(r"(?:[?&]page=(\d+)|(\d+)\.xml$)", re.IGNORECASE)
 
-    locs.sort(key=_priority)
-    return locs[:max_items]
+    def _sort_key(item: Tuple[str, float]) -> Tuple[int, float, int]:
+        u, lmod = item
+        parsed_u = urlparse(u)
+        path_low = (parsed_u.path or "").lower()
+        if low_priority_re.search(path_low):
+            prio = 9
+        elif high_news_re.search(path_low):
+            prio = 0
+        elif editorial_re.search(path_low):
+            prio = 1
+        else:
+            prio = 3
+
+        m_num = chunk_num_re.search(u)
+        chunk_num = int(m_num.group(1) or m_num.group(2) or 0) if m_num else 0
+        return (prio, -lmod, -chunk_num)
+
+    entries.sort(key=_sort_key)
+    return [u for u, _ in entries[:max_items]]
 
 
 def _slug_to_title(url: str) -> str:
@@ -170,4 +207,22 @@ def parse_sitemap_posts(
         )
 
     candidates.sort(key=lambda pair: pair[0], reverse=True)
+
+    # If base_url has no language prefix (e.g. `https://www.washingtoninstitute.org/`),
+    # prefer primary-language URLs when >= 5 non-translated URLs exist so transliterated
+    # `/ar/...` or `/es/...` duplicates do not crowd out primary articles.
+    base_segs = [s.lower() for s in (urlparse(base_url).path or "").split("/") if s]
+    lang_prefixes = {"ar", "fa", "fr", "es", "ru", "zh", "he", "de", "tr", "pt"}
+    if not (base_segs and base_segs[0] in lang_prefixes):
+        primary_only = [
+            pair
+            for pair in candidates
+            if not (
+                (segs := [s.lower() for s in (urlparse(pair[1].post_url).path or "").split("/") if s])
+                and segs[0] in lang_prefixes
+            )
+        ]
+        if len(primary_only) >= 5:
+            candidates = primary_only
+
     return site_title, [post for _, post in candidates[:max_posts]]
