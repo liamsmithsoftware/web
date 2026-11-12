@@ -27,7 +27,7 @@ SKIP_PATH_PATTERNS = re.compile(
     r"solutions|products|featured-insights|market-data|quotes|"
     r"search|wp-login\.php|wp-admin|wp-json|xmlrpc\.php|feed|rss|atom|sitemap|"
     r"tag|tags|tags-[a-z]{2}|issue|issues|topic|topics|vertical|verticals|category|categories|"
-    r"person|people|fellow|fellows|regions|programs|centers|initiatives|spotlights|biographies|newsagencyshow|"
+    r"person|people|fellow|fellows|regions|programs|centers|initiatives|spotlights|biographies|newsagencyshow|igphoto|"
     r"team|staff|experts|author|authors|contributor|contributors|users|webusers|comment|comments|reply"
     r")(?:/|$|\?)",
     re.IGNORECASE,
@@ -69,6 +69,8 @@ SECTION_HUB_SLUGS = {
     "galleries",
     "books",
     "research-commentary",
+    "policy-analysis",
+    "public-releases",
     "arts-culture",
     "mej",
     "news-stories",
@@ -131,7 +133,7 @@ ARTICLE_HINT_URL_RE = re.compile(
     r"news-stories|feature-stories|speeches|"
     r"online-analysis|strategic-comments|military-balance|"
     r"trackers|tracker|analyst-reports|analyst-report|company-news|webinars|resources|"
-    r"analysis|podcasts|podcast|in_the_news|research|reports|report|insights|insight|"
+    r"analysis|policy-analysis|public-releases|podcasts|podcast|in_the_news|research|reports|report|insights|insight|"
     r"publications|publication|commentary|opinions|opinion|briefs|brief|press-releases)/|"
     r"[?&](?:p|id|newsid)=\d+)",
     re.IGNORECASE,
@@ -716,21 +718,35 @@ def extract_listing_posts(
             if not guid:
                 continue
 
+            parent_box = a_tag.find_parent(["li", "div", "section"]) or a_tag
+            single_box = _is_single_card_box(parent_box)
+            url_looks_article = bool(ARTICLE_HINT_URL_RE.search(norm_url)) or norm_url.count("/") >= 4
+
+            fallback_box: Optional[Tag] = None
+            if (
+                single_box
+                and parent_box is not a_tag
+                and url_looks_article
+                and not a_tag.get_text(" ", strip=True)
+            ):
+                distinct_card_urls = {
+                    normalize_article_url(str(other_a.get("href") or ""), base_url=norm_page_url)
+                    for other_a in parent_box.find_all("a", href=True)
+                }
+                distinct_card_urls.discard("")
+                if len(distinct_card_urls) == 1:
+                    fallback_box = parent_box
+
             text, in_heading, full_anchor_text = _extract_clean_title_from_anchor(
-                a_tag, norm_url=norm_url
+                a_tag, fallback_container=fallback_box, norm_url=norm_url
             )
             if len(text) <= 45 and NAV_ANCHOR_TEXT_RE.search(text):
                 continue
-
-            url_looks_article = bool(ARTICLE_HINT_URL_RE.search(norm_url)) or norm_url.count("/") >= 4
 
             # Require meaningful headline length so navigation items like "ورزشی" or "ادامه" are skipped
             min_len = 8 if in_heading else (14 if url_looks_article else 24)
             if len(text) < min_len:
                 continue
-
-            parent_box = a_tag.find_parent(["li", "div", "section"]) or a_tag
-            single_box = _is_single_card_box(parent_box)
 
             summary_source = parent_box if (parent_box is not a_tag and single_box) else a_tag
             card_summary_parts = [

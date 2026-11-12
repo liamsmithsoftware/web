@@ -185,15 +185,33 @@ def discover_feed_urls_in_html(
             seen.add(full_url)
             candidates.append(full_url)
 
-    # Fallback for US DoD / AFPIMS (.gov / .mil) portals that link to `DesktopModules/ArticleCS/RSS.ashx`
+    # Fallback for US DoD / AFPIMS (.gov / .mil) portals (`RSS.ashx`) & RSS directory pages (`/rss-feeds`)
     if not candidates:
+        base_host = (parsed_page.hostname or "").lower().rstrip(".")
+        is_rss_directory_page = any(
+            tok in page_path for tok in ("/rss", "/feed", "/feeds")
+        )
         for a_tag in soup.find_all("a", href=True):
             href = str(a_tag.get("href") or "").strip()
-            if "rss.ashx" not in href.lower():
+            if not href or href.startswith(("#", "javascript:", "mailto:")):
                 continue
             full_url = urljoin(page_url, href)
             parsed_feed = urlparse(full_url)
-            if parsed_feed.scheme in ("http", "https") and full_url not in seen:
+            if parsed_feed.scheme not in ("http", "https"):
+                continue
+            cand_host = (parsed_feed.hostname or "").lower().rstrip(".")
+            f_path = (parsed_feed.path or "").lower()
+            if "sitemap" in f_path:
+                continue
+
+            is_ashx = "rss.ashx" in f_path
+            is_same_host = bool(base_host and cand_host == base_host)
+            is_known_xml_or_feed = is_same_host and (
+                f_path.endswith((".rss", ".atom", "/feed.xml", "/rss.xml", "/whatsnew.xml"))
+                or f_path.rstrip("/") == "/feeds/articles"
+                or (is_rss_directory_page and f_path.endswith(".xml"))
+            )
+            if (is_ashx or is_known_xml_or_feed) and full_url not in seen:
                 seen.add(full_url)
                 candidates.append(full_url)
 

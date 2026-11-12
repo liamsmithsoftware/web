@@ -22,7 +22,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 from app.utils.site_parser import extract_registrable_domain
 
@@ -410,6 +410,32 @@ def _normalize_chromium_proxy(proxy_url: Optional[str]) -> Optional[str]:
     return proxy_url
 
 
+def _split_chromium_proxy_and_auth(
+    proxy_url: Optional[str],
+) -> Tuple[Optional[str], Optional[Tuple[str, str]], bool]:
+    """
+    Splits `proxy_url` into `(chromium_proxy_server, (username, password) | None, supported)`.
+    - Unauthenticated HTTP/HTTPS/SOCKS proxies -> `(normalized, None, True)`
+    - Authenticated HTTP/HTTPS proxies -> `("http://host:port", (user, pass), True)` via CDP `Fetch.authRequired`
+    - Authenticated SOCKS proxies -> `(None, None, False)` (Chromium SOCKS5 lacks RFC 1929 auth)
+    """
+    norm = _normalize_chromium_proxy(proxy_url)
+    if not norm:
+        return None, None, True
+    if "@" not in norm:
+        return norm, None, True
+
+    parsed = urlparse(norm)
+    scheme = (parsed.scheme or "").lower()
+    if scheme not in ("http", "https") or not parsed.hostname or not parsed.port:
+        return None, None, False
+
+    user = unquote(parsed.username or "")
+    pwd = unquote(parsed.password or "")
+    clean_server = f"{scheme}://{parsed.hostname}:{parsed.port}"
+    return clean_server, (user, pwd), True
+
+
 class _RawCdpClient:
     """
     Minimal CDP client that tracks main-frame responses AND automatically applies Client Hints +
@@ -417,9 +443,17 @@ class _RawCdpClient:
     without ever invoking `Runtime.enable`.
     """
 
-    def __init__(self, ws: Any, *, ua_override: Optional[Dict[str, Any]] = None) -> None:
+    def __init__(
+        self,
+        ws: Any,
+        *,
+        ua_override: Optional[Dict[str, Any]] = None,
+        proxy_auth: Optional[Tuple[str, str]] = None,
+    ) -> None:
         self._ws = ws
         self._ua_override = ua_override
+        self._proxy_auth = proxy_auth
+        self._attempted_auth_reqs: Set[str] = set()
         self._next_id = 0
         self._pending: Dict[int, asyncio.Future[Dict[str, Any]]] = {}
         self._bg_tasks: Set[asyncio.Task[Any]] = set()
@@ -438,6 +472,13 @@ class _RawCdpClient:
                 await self.call(
                     "Emulation.setUserAgentOverride",
                     self._ua_override,
+                    timeout=3.0,
+                    session_id=session_id,
+                )
+            if self._proxy_auth:
+                await self.call(
+                    "Fetch.enable",
+                    {"handleAuthRequests": True},
                     timeout=3.0,
                     session_id=session_id,
                 )
@@ -462,6 +503,39 @@ class _RawCdpClient:
                 except Exception:
                     pass
 
+    async def _handle_fetch_paused(self, req_id: str, session_id: Optional[str]) -> None:
+        try:
+            await self.call(
+                "Fetch.continueRequest",
+                {"requestId": req_id},
+                timeout=3.0,
+                session_id=session_id,
+            )
+        except Exception:
+            pass
+
+    async def _handle_proxy_auth(
+        self, req_id: str, is_proxy: bool, session_id: Optional[str]
+    ) -> None:
+        try:
+            if is_proxy and self._proxy_auth and req_id not in self._attempted_auth_reqs:
+                self._attempted_auth_reqs.add(req_id)
+                resp_payload: Dict[str, Any] = {
+                    "response": "ProvideCredentials",
+                    "username": self._proxy_auth[0],
+                    "password": self._proxy_auth[1],
+                }
+            else:
+                resp_payload = {"response": "CancelAuth"}
+            await self.call(
+                "Fetch.continueWithAuth",
+                {"requestId": req_id, "authChallengeResponse": resp_payload},
+                timeout=3.0,
+                session_id=session_id,
+            )
+        except Exception:
+            pass
+
     async def _reader_loop(self) -> None:
         try:
             async for raw_msg in self._ws:
@@ -485,6 +559,26 @@ class _RawCdpClient:
                     waiting = bool(params.get("waitingForDebugger"))
                     if child_sid:
                         task = asyncio.create_task(self._configure_child_target(child_sid, waiting))
+                        self._bg_tasks.add(task)
+                        task.add_done_callback(self._bg_tasks.discard)
+                    continue
+
+                if method == "Fetch.requestPaused":
+                    req_id = str(params.get("requestId") or "")
+                    if req_id:
+                        task = asyncio.create_task(self._handle_fetch_paused(req_id, msg_session))
+                        self._bg_tasks.add(task)
+                        task.add_done_callback(self._bg_tasks.discard)
+                    continue
+
+                if method == "Fetch.authRequired":
+                    req_id = str(params.get("requestId") or "")
+                    challenge = params.get("authChallenge") or {}
+                    is_proxy = str(challenge.get("source") or "").lower() == "proxy"
+                    if req_id:
+                        task = asyncio.create_task(
+                            self._handle_proxy_auth(req_id, is_proxy, msg_session)
+                        )
                         self._bg_tasks.add(task)
                         task.add_done_callback(self._bg_tasks.discard)
                     continue
@@ -701,7 +795,10 @@ async def _run_single_browser_attempt(
     # `DomainClearanceCache.cdp_cookies` preserves full HttpOnly/Secure cf_clearance cookies!
     profile_dir = tempfile.mkdtemp(prefix="wcc_cdp_")
     proc: Optional[subprocess.Popen[bytes]] = None
-    chromium_proxy = _normalize_chromium_proxy(proxy_url)
+    chromium_proxy, proxy_auth, proxy_supported = _split_chromium_proxy_and_auth(proxy_url)
+    if not proxy_supported:
+        shutil.rmtree(profile_dir, ignore_errors=True)
+        return None
 
     cmd: List[str] = [browser_bin]
     if headless:
@@ -788,11 +885,13 @@ async def _run_single_browser_attempt(
         clean_ua = str(ua_override["userAgent"])
 
         async with ws_connect(ws_url, max_size=32 * 1024 * 1024) as ws:
-            cdp = _RawCdpClient(ws, ua_override=ua_override)
+            cdp = _RawCdpClient(ws, ua_override=ua_override, proxy_auth=proxy_auth)
             try:
                 # Do NOT call DOM.enable upfront before navigation so Blink's InspectorDOMAgent
                 # stays untouched while Turnstile's initial non-interactive verification runs!
                 await cdp.call("Network.enable")
+                if proxy_auth:
+                    await cdp.call("Fetch.enable", {"handleAuthRequests": True})
                 await cdp.call("Page.enable")
                 await cdp.call("Network.setUserAgentOverride", ua_override)
                 await cdp.call("Emulation.setUserAgentOverride", ua_override)
@@ -966,8 +1065,8 @@ async def fetch_via_local_browser(
     if not HAS_WEBSOCKETS or ws_connect is None:
         return None
 
-    # Chromium --proxy-server does not accept inline user:pass@ without an extension
-    if proxy_url and "@" in proxy_url:
+    _, _, proxy_supported = _split_chromium_proxy_and_auth(proxy_url)
+    if not proxy_supported:
         return None
 
     browser_bin = find_local_browser_executable()

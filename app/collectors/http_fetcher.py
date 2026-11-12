@@ -55,8 +55,10 @@ WAF_BODY_MARKERS = (
     "sucuri website firewall",
     "access denied |",
     "<title>access denied</title>",
+    "you don't have permission to access",
     "edgesuite.net",
     "reference #18.",
+    "reference #",
     "arvancloud",
 )
 
@@ -227,6 +229,15 @@ def _is_ssl_cert_error(exc: Exception) -> bool:
     return "SSL" in msg or "CERTIFICATE" in msg or "CERT_" in msg
 
 
+def _uses_non_public_ca(url: str) -> bool:
+    """
+    U.S. Department of Defense `.mil` websites sign certificates with the DoD PKI Root CA,
+    which is never shipped inside Python `certifi` or `curl_cffi` Mozilla CA bundles.
+    """
+    host = (urlparse(url or "").hostname or "").lower().rstrip(".")
+    return host == "mil" or host.endswith(".mil")
+
+
 class SmartHttpFetcher:
     """
     4-Layer Resilient HTTP Client:
@@ -292,10 +303,18 @@ class SmartHttpFetcher:
 
                 return primary_resp
 
-            except (httpx.ProxyError, httpx.ConnectError, httpx.ConnectTimeout) as exc:
+            except httpx.ProxyError as exc:
                 last_error = exc
-                # If explicit user proxy itself is unreachable, report immediately so user can fix proxy settings
                 if is_explicit:
+                    self._raise_translated_network_error(exc, url, is_explicit_proxy=True)
+                if primary_resp is not None:
+                    return primary_resp
+                if idx + 1 < len(candidates):
+                    continue
+                self._raise_translated_network_error(exc, url, is_explicit_proxy=False)
+            except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+                last_error = exc
+                if is_explicit and "proxy" in str(exc).lower():
                     self._raise_translated_network_error(exc, url, is_explicit_proxy=True)
                 # If secondary direct rescue timed out (because site is filtered without VPN), return primary_resp!
                 if primary_resp is not None:
@@ -309,7 +328,7 @@ class SmartHttpFetcher:
                 raise
             except Exception as exc:
                 last_error = exc
-                if is_explicit:
+                if is_explicit and "proxy" in str(exc).lower():
                     self._raise_translated_network_error(exc, url, is_explicit_proxy=True)
                 if primary_resp is not None:
                     return primary_resp
@@ -350,9 +369,12 @@ class SmartHttpFetcher:
             best_resp = httpx_resp
             if not is_waf_challenge(httpx_resp.status_code, httpx_resp.text, httpx_resp.headers):
                 return httpx_resp
-        except (httpx.ProxyError, httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout) as exc:
-            # Recover automatically when a site uses DoD/national Root CAs (e.g. .mil) or an incomplete
-            # intermediate/vanity-redirect certificate chain missing from Python's static certifi bundle
+        except httpx.ProxyError as exc:
+            # Fail fast when the user's local proxy port itself is unreachable
+            raise exc
+        except (httpx.HTTPError, ssl.SSLError) as exc:
+            # Recover automatically when a site uses DoD/national Root CAs (e.g. .mil), incomplete
+            # intermediate chains, or Akamai HTTP/2 RemoteProtocolError / ReadError stream resets
             if ssl_verify_for_target and _is_ssl_cert_error(exc):
                 ssl_verify_for_target = False
                 try:
@@ -367,7 +389,9 @@ class SmartHttpFetcher:
                     best_resp = httpx_resp
                     if not is_waf_challenge(httpx_resp.status_code, httpx_resp.text, httpx_resp.headers):
                         return httpx_resp
-                except (httpx.ProxyError, httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout) as exc2:
+                except httpx.ProxyError as exc_proxy:
+                    raise exc_proxy
+                except (httpx.HTTPError, ssl.SSLError) as exc2:
                     httpx_exc = exc2
             else:
                 httpx_exc = exc
@@ -434,7 +458,7 @@ class SmartHttpFetcher:
             browser_res = await fetch_via_local_browser(
                 target_for_browser,
                 proxy_url=proxy_url,
-                verify_ssl=ssl_verify_for_target,
+                verify_ssl=ssl_verify_for_target and not _uses_non_public_ca(target_for_browser),
                 custom_cookie=merged_browser_cookie,
                 timeout_sec=max(18.0, self.timeout_sec),
             )
@@ -552,37 +576,43 @@ class SmartHttpFetcher:
         best_resp: Optional[HttpFetchResponse] = None
 
         for profile in ("chrome", "safari", "firefox"):
-            try:
-                async with CurlAsyncSession(
-                    impersonate=profile,
-                    verify=use_verify,
-                    proxy=curl_proxy,
-                    timeout=timeout_sec,
-                    allow_redirects=True,
-                    max_redirects=10,
-                ) as session:
-                    if is_subpath and profile in ("chrome", "safari") and not clearance:
-                        try:
-                            await session.get(origin, timeout=min(8.0, timeout_sec))
-                        except Exception:
-                            pass
+            verify_attempts = [use_verify, False] if use_verify else [False]
+            for v_flag in verify_attempts:
+                try:
+                    async with CurlAsyncSession(
+                        impersonate=profile,
+                        verify=v_flag,
+                        proxy=curl_proxy,
+                        timeout=timeout_sec,
+                        allow_redirects=True,
+                        max_redirects=10,
+                    ) as session:
+                        if is_subpath and profile in ("chrome", "safari") and not clearance:
+                            try:
+                                await session.get(origin, timeout=min(8.0, timeout_sec))
+                            except Exception:
+                                pass
 
-                    resp = await session.get(url, headers=extra_headers or None)
-                    lower_headers = {str(k).lower(): str(v) for k, v in resp.headers.items()}
-                    candidate = HttpFetchResponse(
-                        url=str(resp.url),
-                        status_code=int(resp.status_code),
-                        text=resp.text,
-                        headers=lower_headers,
-                        via=f"curl_cffi:{profile}",
-                    )
-                    best_resp = candidate
-                    if candidate.status_code < 400 and not is_waf_challenge(
-                        candidate.status_code, candidate.text, candidate.headers
-                    ):
-                        return candidate
-            except Exception:
-                continue
+                        resp = await session.get(url, headers=extra_headers or None)
+                        lower_headers = {str(k).lower(): str(v) for k, v in resp.headers.items()}
+                        candidate = HttpFetchResponse(
+                            url=str(resp.url),
+                            status_code=int(resp.status_code),
+                            text=resp.text,
+                            headers=lower_headers,
+                            via=f"curl_cffi:{profile}",
+                        )
+                        best_resp = candidate
+                        if candidate.status_code < 400 and not is_waf_challenge(
+                            candidate.status_code, candidate.text, candidate.headers
+                        ):
+                            return candidate
+                        break
+                except Exception as exc_curl:
+                    if v_flag and _is_ssl_cert_error(exc_curl):
+                        use_verify = False
+                        continue
+                    break
 
         return best_resp
 
