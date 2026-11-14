@@ -20,7 +20,15 @@ from app.collectors.feed_parser import (
     parse_feed_content,
 )
 from app.collectors.html_scraper import extract_article_details, extract_listing_posts
-from app.collectors.http_fetcher import HttpFetchResponse, SmartHttpFetcher
+from app.collectors.http_fetcher import (
+    HttpFetchResponse,
+    SmartHttpFetcher,
+    is_waf_challenge,
+)
+from app.collectors.site_profiles import (
+    get_site_profile,
+    known_listing_pages_for,
+)
 from app.collectors.sitemap_parser import (
     extract_child_sitemaps,
     is_sitemap_xml,
@@ -118,10 +126,18 @@ def _resolve_known_public_feeds(url: str) -> List[str]:
     Returns known official external RSS feeds for sites that host feeds on a separate CDN
     behind DataDome/paywalls (`wsj.com`), AFPIMS `RSS.ashx` portals (`war.gov` / `defense.gov`),
     or vanity domains (`ipforum.org` -> `israelpolicyforum.org/feed/`).
+
+    Domains with a verified `SiteProfile` are authoritative: e.g. Lawfare's
+    `/feeds/articles` currently returns an RSS channel with ZERO items, so it must
+    not be advertised as a working feed at all.
     """
     parsed = urlparse(url or "")
     reg_domain = extract_registrable_domain(parsed.hostname or "")
     path_parts = [seg.lower() for seg in (parsed.path or "").split("/") if seg]
+
+    profile = get_site_profile(url)
+    if profile is not None:
+        return list(profile.feeds)
 
     if reg_domain == "wsj.com":
         if path_parts:
@@ -155,10 +171,11 @@ def _resolve_known_public_feeds(url: str) -> List[str]:
             "https://israelpolicyforum.org/feed/",
         ]
 
-    if reg_domain == "lawfaremedia.org" and (
-        not path_parts or path_parts[0] in ("article", "articles", "feeds", "rss.xml", "feed")
-    ):
-        return ["https://www.lawfaremedia.org/feeds/articles"]
+    # NOTE: lawfaremedia.org deliberately has NO known feed here. Its
+    # `/feeds/articles` endpoint answers 200 with an empty <channel> (zero
+    # <item> nodes) and `/feed/`, `/rss.xml`, `/feeds/all` are 404. Probing it
+    # only wastes a request (and can trigger a pointless headless-browser run),
+    # so the clean HTML listing in `site_profiles` is used instead.
 
     if reg_domain == "chathamhouse.org" and (
         not path_parts or path_parts[0] in ("rss", "rss.xml", "rss-feeds", "feed")
@@ -334,7 +351,13 @@ class WebSiteCollector:
         if not canonical_url:
             raise CollectorError("آدرس وب‌سایت نامعتبر یا خالی است.")
 
-        fetcher = SmartHttpFetcher(settings)
+        # <--- جدید: تزریق پروکسی اختصاصی سایت از پروفایل
+        profile = get_site_profile(canonical_url)
+        fetcher_settings = dict(settings)
+        if profile and profile.proxy_url:
+            fetcher_settings["site_proxy_url"] = profile.proxy_url
+
+        fetcher = SmartHttpFetcher(fetcher_settings)
 
         if mode == "html":
             return await self._fetch_via_html(fetcher, canonical_url, tz_name)
@@ -515,6 +538,112 @@ class WebSiteCollector:
                 continue
         return None
 
+    @staticmethod
+    def _post_belongs_to_domain(post: FetchedPost, reg_domain: str) -> bool:
+        if not reg_domain:
+            return True
+        post_domain = extract_registrable_domain(urlparse(post.post_url).hostname or "")
+        return bool(post_domain and post_domain == reg_domain)
+
+    async def _probe_known_public_feeds(
+        self,
+        fetcher: SmartHttpFetcher,
+        canonical_url: str,
+        tz_name: str,
+        *,
+        allow_browser_retry: bool = True,
+    ) -> Optional[FetchBatchResult]:
+        """Probe the verified official feeds/APIs for a profiled site first.
+
+        AFPiMS `.mil` feeds are *aggregated* across the whole platform, so their
+        items are filtered back to the host the user is actually monitoring.
+        """
+        feeds = _resolve_known_public_feeds(canonical_url)
+        if not feeds:
+            return None
+
+        fast_probe = SmartHttpFetcher(fetcher.settings, allow_browser_fallback=False)
+        result = await self._probe_candidate_endpoints(
+            fast_probe, feeds, base_url=canonical_url, tz_name=tz_name
+        )
+        if (
+            result is None
+            and allow_browser_retry
+            and fetcher.allow_browser_fallback
+        ):
+            # Some publishers challenge the plain HTTP client but let a real
+            # browser through; retry only the top endpoint to keep it cheap.
+            result = await self._probe_candidate_endpoints(
+                fetcher, feeds[:1], base_url=canonical_url, tz_name=tz_name
+            )
+
+        profile = get_site_profile(canonical_url)
+        if result is not None and profile and profile.filter_feed_posts_to_domain:
+            target = extract_registrable_domain(urlparse(canonical_url).hostname or "")
+            result.posts = [
+                p for p in result.posts if self._post_belongs_to_domain(p, target)
+            ]
+            if not result.posts:
+                return None
+        return result
+
+    async def _rescue_via_known_listing_pages(
+        self,
+        fetcher: SmartHttpFetcher,
+        canonical_url: str,
+        tz_name: str,
+        *,
+        existing_posts: Optional[List[FetchedPost]] = None,
+        require_more: bool = False,
+    ) -> Optional[FetchBatchResult]:
+        """Scrape an official clean listing page instead of a JS/WAF-heavy homepage.
+
+        Used for MEMRI (`/archives`), Lawfare (`/article/highlights`), CUSNC
+        (`/Media/News/`) and AFCENT (`/News/Article-List/`), and as a rescue when
+        the monitored URL itself answers 403/503 or yields no articles.
+        """
+        pages = known_listing_pages_for(canonical_url)
+        if not pages:
+            return None
+
+        canonical_norm = (_https_upgrade_candidate(canonical_url) or canonical_url).rstrip("/").lower()
+        existing = existing_posts or []
+        origin_ref = _origin_of(canonical_norm)
+
+        for page in pages:
+            page_norm = (_https_upgrade_candidate(page) or page).rstrip("/").lower()
+            if page_norm == canonical_norm:
+                continue
+            try:
+                resp = await self._get_with_https_upgrade(
+                    fetcher, page, referer=origin_ref
+                )
+            except CollectorError:
+                continue
+            if resp.status_code != 200 or not resp.text:
+                continue
+            if _is_sso_login_wall(resp, page) or is_waf_challenge(
+                resp.status_code, resp.text, resp.headers
+            ):
+                continue
+            try:
+                title, posts = extract_listing_posts(
+                    resp.text, page_url=resp.url or page, tz_name=tz_name
+                )
+            except CollectorError:
+                continue
+            if not posts:
+                continue
+            if require_more and len(posts) <= len(existing):
+                continue
+            return FetchBatchResult(
+                site_title=title,
+                posts=posts,
+                source_mode="html",
+                discovered_feed_url=None,
+            )
+        return None
+
     async def _probe_sitemap_rescue(
         self,
         settings: Dict[str, str],
@@ -651,14 +780,16 @@ class WebSiteCollector:
                 resp = root_resp
 
         if resp.status_code in (401, 403, 429, 503):
-            public_feeds = _resolve_known_public_feeds(canonical_url)
-            if public_feeds:
-                fast_probe = SmartHttpFetcher(fetcher.settings, allow_browser_fallback=False)
-                rescued_feed = await self._probe_candidate_endpoints(
-                    fast_probe, public_feeds, base_url=canonical_url, tz_name=tz_name
-                )
-                if rescued_feed is not None:
-                    return rescued_feed
+            rescued_feed = await self._probe_known_public_feeds(
+                fetcher, canonical_url, tz_name, allow_browser_retry=False
+            )
+            if rescued_feed is not None:
+                return rescued_feed
+            rescued_page = await self._rescue_via_known_listing_pages(
+                fetcher, canonical_url, tz_name
+            )
+            if rescued_page is not None:
+                return rescued_page
 
         resp.raise_for_status()
 
@@ -676,7 +807,20 @@ class WebSiteCollector:
             )
             if upgraded_empty is not None:
                 return upgraded_empty
+            rescued = await self._rescue_via_known_listing_pages(
+                fetcher, canonical_url, tz_name
+            )
+            if rescued is not None:
+                return rescued
             raise
+
+        profile = get_site_profile(canonical_url)
+        if profile and profile.prefer_listing_pages:
+            preferred = await self._rescue_via_known_listing_pages(
+                fetcher, canonical_url, tz_name, existing_posts=posts
+            )
+            if preferred is not None:
+                return preferred
 
         upgraded = await self._try_sparse_homepage_hub_upgrade(
             fetcher, resp.text, resp.url, tz_name, existing_posts=posts, existing_title=title
@@ -710,14 +854,11 @@ class WebSiteCollector:
             if res is not None:
                 return res
 
-        public_feeds = _resolve_known_public_feeds(canonical_url)
-        if public_feeds:
-            fast_probe = SmartHttpFetcher(fetcher.settings, allow_browser_fallback=False)
-            pub_res = await self._probe_candidate_endpoints(
-                fast_probe, public_feeds, base_url=canonical_url, tz_name=tz_name
-            )
-            if pub_res is not None:
-                return pub_res
+        pub_res = await self._probe_known_public_feeds(
+            fetcher, canonical_url, tz_name, allow_browser_retry=False
+        )
+        if pub_res is not None:
+            return pub_res
 
         resp = await self._get_with_https_upgrade(fetcher, canonical_url)
         if _is_sso_login_wall(resp, canonical_url):
@@ -839,21 +980,15 @@ class WebSiteCollector:
                         pass
                 resp.raise_for_status()
 
-        # 1b. Known official external feeds (wsj.com, war.gov, lawfaremedia.org, chathamhouse.org, mei.edu)
-        public_feeds = _resolve_known_public_feeds(canonical_url)
-        if public_feeds:
-            fast_probe = SmartHttpFetcher(fetcher.settings, allow_browser_fallback=False)
-            pub_res = await self._probe_candidate_endpoints(
-                fast_probe, public_feeds, base_url=canonical_url, tz_name=tz_name
-            )
-            if pub_res is not None:
-                return pub_res
-            if fetcher.allow_browser_fallback:
-                pub_browser_res = await self._probe_candidate_endpoints(
-                    fetcher, public_feeds[:1], base_url=canonical_url, tz_name=tz_name
-                )
-                if pub_browser_res is not None:
-                    return pub_browser_res
+        # 1b. Verified official feeds/REST APIs (wsj.com, war.gov, bicom.org.uk,
+        #     israelpolicyforum.org, aggregated .mil RSS.ashx, ...). Probing these
+        #     BEFORE the homepage avoids Cloudflare/Turnstile entirely on sites
+        #     whose API endpoints are public but whose `/` is challenged.
+        pub_res = await self._probe_known_public_feeds(
+            fetcher, canonical_url, tz_name
+        )
+        if pub_res is not None:
+            return pub_res
 
         # 2. Fetch the main target URL (preferring https:// for plain http:// public URLs)
         resp = await self._get_with_https_upgrade(fetcher, canonical_url)
@@ -921,6 +1056,14 @@ class WebSiteCollector:
                 if sm_rescued is not None:
                     return sm_rescued
 
+            # Official clean listing pages (e.g. /Media/News/, /archives,
+            # /article/highlights) often stay reachable even when `/` is blocked.
+            listing_rescued = await self._rescue_via_known_listing_pages(
+                fetcher, canonical_url, tz_name
+            )
+            if listing_rescued is not None:
+                return listing_rescued
+
             resp.raise_for_status()
 
         # 3. Direct feed or WP REST JSON document
@@ -952,9 +1095,20 @@ class WebSiteCollector:
             if found is not None:
                 return found
 
-        # 6. Scrape HTML listing directly (handles custom portals like iiss.org, lawfaremedia.org, criticalthreats.org, en.idi.org.il)
+        # 6. Scrape HTML listing directly (handles custom portals like iiss.org, criticalthreats.org, en.idi.org.il)
         try:
             title, posts = extract_listing_posts(resp.text, page_url=final_url, tz_name=tz_name)
+
+            # For profiled sites with a JS carousel / truncated-ticker homepage,
+            # prefer the clean official listing page (full headlines + dates).
+            profile = get_site_profile(canonical_url)
+            if profile and profile.prefer_listing_pages:
+                preferred = await self._rescue_via_known_listing_pages(
+                    fetcher, canonical_url, tz_name, existing_posts=posts
+                )
+                if preferred is not None:
+                    return preferred
+
             upgraded = await self._try_sparse_homepage_hub_upgrade(
                 fetcher, resp.text, final_url, tz_name, existing_posts=posts, existing_title=title
             )
@@ -977,6 +1131,11 @@ class WebSiteCollector:
             )
             if rescued is not None:
                 return rescued
+            listing_rescued = await self._rescue_via_known_listing_pages(
+                fetcher, canonical_url, tz_name
+            )
+            if listing_rescued is not None:
+                return listing_rescued
             if is_root:
                 upgraded_empty = await self._try_sparse_homepage_hub_upgrade(
                     fetcher, resp.text, final_url, tz_name, existing_posts=[]

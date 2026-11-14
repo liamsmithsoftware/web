@@ -69,19 +69,38 @@ class SiteSchedulerService:
             self.last_tick_at = utc_now_iso()
             due_sites = self.db.get_due_sites(self.last_tick_at)
             processed = 0
+            
+            # <--- جدید: اجرای همزمان سایت‌ها برای جلوگیری از وقفه در زمان‌بندی
+            tasks = []
             for idx, site in enumerate(due_sites):
-                if idx > 0:
-                    await asyncio.sleep(1.0)
                 site_id = int(site["id"])
                 self.currently_syncing_site_id = site_id
-                try:
-                    await self.sync_manager.sync_site(site_id, trigger_type="scheduled")
-                    processed += 1
-                except Exception as exc:
-                    logger.exception("Scheduled sync failed for site %s: %s", site_id, exc)
-                finally:
-                    self.currently_syncing_site_id = None
+                
+                # ایجاد وظیفه جداگانه برای هر سایت
+                task = asyncio.create_task(
+                    self._sync_single_site(site_id, "scheduled")
+                )
+                tasks.append(task)
+                
+            # انتظار برای اتمام تمام سایت‌ها (با محدودیت همزمان‌سازی در SyncManager)
+            if tasks:
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                for res in results:
+                    if isinstance(res, int) and res > 0:
+                        processed += res
+                    elif isinstance(res, Exception):
+                        logger.exception("Scheduled sync task failed: %s", res)
+                        
+            self.currently_syncing_site_id = None
             return processed
+
+    async def _sync_single_site(self, site_id: int, trigger_type: str) -> int:
+        try:
+            await self.sync_manager.sync_site(site_id, trigger_type=trigger_type)
+            return 1
+        except Exception as exc:
+            logger.exception("Scheduled sync failed for site %s: %s", site_id, exc)
+            return 0
 
     def get_status(self) -> Dict[str, Any]:
         return {
