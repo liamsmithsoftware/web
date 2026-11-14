@@ -111,6 +111,18 @@ def _classify_mime_or_url(mime: str, url: str) -> str:
     return "text"
 
 
+# Feeds that answer HTTP 200 with a valid RSS <channel> but ZERO <item> nodes.
+# Probing them cannot produce posts and needlessly burns a request / browser run.
+KNOWN_EMPTY_FEEDS = (("lawfaremedia.org", "/feeds/articles"),)
+
+
+def is_known_empty_feed(url: str) -> bool:
+    parsed = urlparse(url or "")
+    host = (parsed.hostname or "").lower()
+    path = (parsed.path or "").rstrip("/").lower()
+    return any(host.endswith(domain) and path == feed_path for domain, feed_path in KNOWN_EMPTY_FEEDS)
+
+
 def is_feed_document(text: str, content_type: str = "") -> bool:
     ctype = (content_type or "").lower()
     head = (text or "").lstrip()[:1200]
@@ -169,8 +181,15 @@ def discover_feed_urls_in_html(
         parsed_feed = urlparse(full_url)
         if parsed_feed.scheme not in ("http", "https"):
             continue
+        if is_known_empty_feed(full_url):
+            continue
 
-        if section_strict and page_path and page_path not in ("", "/", "/fa", "/en", "/index.html"):
+        if (
+            section_strict
+            and "rss.ashx" not in full_url.lower()
+            and page_path
+            and page_path not in ("", "/", "/fa", "/en", "/index.html")
+        ):
             feed_path = (parsed_feed.path or "/").lower()
             feed_query = (parsed_feed.query or "").lower()
             # Keep feed only if it belongs to or references this section
@@ -191,8 +210,8 @@ def discover_feed_urls_in_html(
         is_rss_directory_page = any(
             tok in page_path for tok in ("/rss", "/feed", "/feeds")
         )
-        for a_tag in soup.find_all("a", href=True):
-            href = str(a_tag.get("href") or "").strip()
+        for feed_tag in soup.find_all(["a", "link"], href=True):
+            href = str(feed_tag.get("href") or "").strip()
             if not href or href.startswith(("#", "javascript:", "mailto:")):
                 continue
             full_url = urljoin(page_url, href)
@@ -208,7 +227,7 @@ def discover_feed_urls_in_html(
             is_same_host = bool(base_host and cand_host == base_host)
             is_known_xml_or_feed = is_same_host and (
                 f_path.endswith((".rss", ".atom", "/feed.xml", "/rss.xml", "/whatsnew.xml"))
-                or f_path.rstrip("/") == "/feeds/articles"
+                or (f_path.rstrip("/") == "/feeds/articles" and not is_known_empty_feed(full_url))
                 or (is_rss_directory_page and f_path.endswith(".xml"))
             )
             if (is_ashx or is_known_xml_or_feed) and full_url not in seen:

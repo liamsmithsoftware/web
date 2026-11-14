@@ -146,6 +146,7 @@ def resolve_proxy_candidates(
     """
     Returns ordered list of (proxy_url, is_explicit_user_proxy).
     - Never uses a proxy for localhost / 127.0.0.1 targets.
+    - Checks site-specific proxy (site_proxy_url) if provided in settings.
     - For domestic `.ir` sites (e.g. `ipis.ir`, `mfa.gov.ir`, `isna.ir`), tries direct
       connection (`None`) FIRST because Iranian ministry/domestic firewalls frequently
       drop or block foreign VPN IPs, keeping the proxy as secondary fallback.
@@ -153,6 +154,11 @@ def resolve_proxy_candidates(
     """
     if _is_loopback_target(target_url):
         return [(None, False)]
+
+    # <--- جدید: بررسی پروکسی اختصاصی سایت
+    site_proxy = settings.get("site_proxy_url")
+    if site_proxy:
+        return [(site_proxy, True)]
 
     is_ir = _is_domestic_ir_target(target_url)
 
@@ -373,8 +379,35 @@ class SmartHttpFetcher:
             # Fail fast when the user's local proxy port itself is unreachable
             raise exc
         except (httpx.HTTPError, ssl.SSLError) as exc:
+            httpx_exc = exc
             # Recover automatically when a site uses DoD/national Root CAs (e.g. .mil), incomplete
-            # intermediate chains, or Akamai HTTP/2 RemoteProtocolError / ReadError stream resets
+            # intermediate chains, or Akamai HTTP/2 RemoteProtocolError / ReadError stream resets.
+            # One cheap HTTP/1.1 retry (with verification relaxed for TLS failures) usually
+            # succeeds where HTTP/2 ALPN negotiation was reset by the edge server.
+            if not _is_loopback_target(url):
+                h1_verify = (
+                    False
+                    if (ssl_verify_for_target and _is_ssl_cert_error(exc))
+                    else ssl_verify_for_target
+                )
+                try:
+                    h1_resp = await self._fetch_httpx(
+                        url,
+                        proxy_url=proxy_url,
+                        accept_kind=accept_kind,
+                        referer=referer,
+                        timeout_sec=effective_timeout,
+                        verify_override=h1_verify,
+                        force_http1=True,
+                    )
+                    best_resp = h1_resp
+                    if not is_waf_challenge(h1_resp.status_code, h1_resp.text, h1_resp.headers):
+                        return h1_resp
+                except httpx.ProxyError as exc_proxy:
+                    raise exc_proxy
+                except (httpx.HTTPError, ssl.SSLError) as exc_h1:
+                    httpx_exc = exc_h1
+
             if ssl_verify_for_target and _is_ssl_cert_error(exc):
                 ssl_verify_for_target = False
                 try:
@@ -393,8 +426,6 @@ class SmartHttpFetcher:
                     raise exc_proxy
                 except (httpx.HTTPError, ssl.SSLError) as exc2:
                     httpx_exc = exc2
-            else:
-                httpx_exc = exc
 
         # Layer 2: Escalate to curl_cffi real browser TLS/JA3/JA4/HTTP2 impersonation
         if HAS_CURL_CFFI and not _is_loopback_target(url):
@@ -492,6 +523,7 @@ class SmartHttpFetcher:
         referer: Optional[str],
         timeout_sec: float,
         verify_override: Optional[bool] = None,
+        force_http1: bool = False,
     ) -> HttpFetchResponse:
         effective_settings = dict(self.settings)
         clearance = CLEARANCE_CACHE.get(url, proxy_url)
@@ -506,8 +538,9 @@ class SmartHttpFetcher:
         headers = build_request_headers(
             effective_settings, referer=referer, accept_kind=accept_kind
         )
-        # Always enable HTTP/2 and Chrome TLS ciphers (even on http:// URLs that 301-redirect to https://!)
-        use_h2 = HAS_HTTP2 and not (proxy_url and proxy_url.startswith("socks"))
+        # Always enable HTTP/2 and Chrome TLS ciphers (even on http:// URLs that 301-redirect to https://!),
+        # except for the explicit HTTP/1.1 retry used against Akamai/.mil ALPN resets.
+        use_h2 = HAS_HTTP2 and not force_http1 and not (proxy_url and proxy_url.startswith("socks"))
         use_verify = self.verify_ssl if verify_override is None else verify_override
         verify_arg = _build_ssl_context(use_verify)
 
