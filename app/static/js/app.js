@@ -653,13 +653,29 @@ function openEditModal(siteId) {
     const site = state.sites.find((s) => String(s.id) === String(siteId));
     if (!site) return;
     state.editingSiteId = site.id;
-    $("#editSiteId").value = site.id;
-    $("#editSiteTitle").value = site.title || "";
-    $("#editIntervalValue").value = site.interval_value;
-    $("#editIntervalUnit").value = site.interval_unit;
-    $("#editInitialLimit").value = site.initial_limit;
-    $("#editSiteActive").checked = Boolean(site.is_active);
-    $("#editSiteModal").classList.remove("hidden");
+    document.getElementById("editSiteId").value = site.id;
+    document.getElementById("editSiteTitle").value = site.title || "";
+    document.getElementById("editIntervalValue").value = site.interval_value;
+    document.getElementById("editIntervalUnit").value = site.interval_unit;
+    document.getElementById("editInitialLimit").value = site.initial_limit;
+    document.getElementById("editSiteActive").checked = Boolean(site.is_active);
+    
+    // Populate Proxy URL fields
+    if (site.proxy_url) {
+        const parts = site.proxy_url.split("://");
+        const type = parts[0] || "socks5";
+        const hostPort = parts[1] || "";
+        const [host, port] = hostPort.split(":");
+        document.getElementById("editSiteProxyHost").value = host || "";
+        document.getElementById("editSiteProxyPort").value = port || "";
+        document.getElementById("editSiteProxyType").value = type;
+    } else {
+        document.getElementById("editSiteProxyHost").value = "";
+        document.getElementById("editSiteProxyPort").value = "";
+        document.getElementById("editSiteProxyType").value = "socks5";
+    }
+    
+    document.getElementById("editSiteModal").classList.remove("hidden");
 }
 
 function initEditForm() {
