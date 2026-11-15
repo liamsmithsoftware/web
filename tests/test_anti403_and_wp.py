@@ -886,7 +886,8 @@ async def test_dod_mil_ssl_cert_auto_recovery_and_afcent_scraping(monkeypatch):
     verify_calls = []
 
     async def _fake_httpx_fetch(
-        self, url, *, proxy_url, accept_kind, referer, timeout_sec, verify_override=None
+        self, url, *, proxy_url, accept_kind, referer, timeout_sec, verify_override=None,
+        force_http1=False,
     ):
         effective_verify = self.verify_ssl if verify_override is None else verify_override
         verify_calls.append(effective_verify)
@@ -1523,8 +1524,15 @@ async def test_lawfare_chathamhouse_feeds_and_authenticated_http_proxy_cdp(monke
     from app.collectors.browser_fetcher import _split_chromium_proxy_and_auth
     from app.collectors.web_collector import _resolve_known_public_feeds
 
-    assert _resolve_known_public_feeds("https://www.lawfaremedia.org/") == [
-        "https://www.lawfaremedia.org/feeds/articles"
+    # Lawfare's `/feeds/articles` answers 200 with an EMPTY <channel> (zero
+    # <item> nodes) and /feed/, /rss.xml, /feeds/all are 404. It must not be
+    # advertised as a usable feed any more; the clean HTML listing is used.
+    from app.collectors.site_profiles import known_listing_pages_for
+
+    assert _resolve_known_public_feeds("https://www.lawfaremedia.org/") == []
+    assert known_listing_pages_for("https://www.lawfaremedia.org/") == [
+        "https://www.lawfaremedia.org/article/highlights",
+        "https://www.lawfaremedia.org/",
     ]
     assert _resolve_known_public_feeds("https://www.chathamhouse.org/") == [
         "https://www.chathamhouse.org/path/whatsnew.xml"
