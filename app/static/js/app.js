@@ -663,24 +663,30 @@ function openEditModal(siteId) {
 }
 
 function initEditForm() {
-    const form = $("#editSiteForm");
+    const form = document.getElementById("editSiteForm");
     if (!form) return;
     form.addEventListener("submit", async (event) => {
         event.preventDefault();
-        const id = $("#editSiteId").value;
+        const id = document.getElementById("editSiteId").value;
         if (!id) return;
 
+        const proxyHost = document.getElementById("editSiteProxyHost")?.value.trim() || "";
+        const proxyPort = document.getElementById("editSiteProxyPort")?.value.trim() || "";
+        const proxyType = document.getElementById("editSiteProxyType")?.value || "socks5";
+        const proxyUrl = (proxyHost && proxyPort) ? `${proxyType}://${proxyHost}:${proxyPort}` : null;
+
         const payload = {
-            title: $("#editSiteTitle").value.trim(),
-            interval_value: Number($("#editIntervalValue").value),
-            interval_unit: $("#editIntervalUnit").value,
-            initial_limit: Number($("#editInitialLimit").value),
-            is_active: $("#editSiteActive").checked,
+            title: document.getElementById("editSiteTitle").value.trim(),
+            interval_value: Number(document.getElementById("editIntervalValue").value),
+            interval_unit: document.getElementById("editIntervalUnit").value,
+            initial_limit: Number(document.getElementById("editInitialLimit").value),
+            is_active: document.getElementById("editSiteActive").checked,
+            proxy_url: proxyUrl,
         };
 
         try {
             await apiFetch(`/api/sites/${id}`, { method: "PUT", body: payload });
-            $("#editSiteModal").classList.add("hidden");
+            document.getElementById("editSiteModal").classList.add("hidden");
             showToast("تنظیمات وب‌سایت با موفقیت ذخیره شد.", "success");
             await Promise.all([loadSites(), loadOverview()]);
         } catch (err) {
@@ -688,6 +694,7 @@ function initEditForm() {
         }
     });
 }
+
 
 async function handleSiteAction(action, siteId, button) {
     const site = state.sites.find((s) => String(s.id) === String(siteId));
