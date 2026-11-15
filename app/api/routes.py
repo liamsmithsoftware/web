@@ -214,6 +214,7 @@ async def create_site(payload: SiteCreateRequest, request: Request) -> Dict[str,
             initial_limit=payload.initial_limit,
             title=payload.title,
             is_active=payload.is_active,
+            proxy_url=payload.proxy_url,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -258,6 +259,7 @@ async def update_site(
             interval_unit=payload.interval_unit,
             initial_limit=payload.initial_limit,
             is_active=payload.is_active,
+            proxy_url=payload.proxy_url,
         )
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc

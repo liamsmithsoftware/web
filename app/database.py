@@ -258,6 +258,7 @@ class DatabaseManager:
         title: Optional[str] = None,
         is_active: bool = True,
         is_demo: bool = False,
+        proxy_url: Optional[str] = None,  # <--- جدید: پروکسی اختصاصی در سطح اپلیکیشن
     ) -> Dict[str, Any]:
         interval_minutes = compute_interval_minutes(interval_value, interval_unit)
         if initial_limit < 1 or initial_limit > 100:
@@ -282,9 +283,9 @@ class DatabaseManager:
                 INSERT INTO sites (
                     site_key, site_input, domain, canonical_url, feed_url,
                     title, custom_title, is_direct_feed, interval_value, interval_unit,
-                    interval_minutes, initial_limit, is_active, is_demo,
+                    interval_minutes, initial_limit, is_active, is_demo, proxy_url,
                     next_fetch_at, last_status, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
                 """,
                 (
                     parsed.site_key,
@@ -301,6 +302,7 @@ class DatabaseManager:
                     int(initial_limit),
                     1 if is_active else 0,
                     1 if is_demo else 0,
+                    proxy_url,  # <--- جدید: پروکسی اختصاصی
                     next_iso,
                     now_iso,
                     now_iso,
@@ -361,6 +363,7 @@ class DatabaseManager:
         interval_unit: Optional[str] = None,
         initial_limit: Optional[int] = None,
         is_active: Optional[bool] = None,
+        proxy_url: Optional[str] = None,  # <--- جدید: تغییر پروکسی در سطح اپلیکیشن
     ) -> Dict[str, Any]:
         current = self.get_site(site_id)
         if not current:
@@ -398,33 +401,65 @@ class DatabaseManager:
                 next_fetch = format_iso_utc(now_dt + timedelta(minutes=new_minutes))
 
         with self.transaction() as conn:
-            conn.execute(
-                """
-                UPDATE sites
-                SET title = ?,
-                    custom_title = ?,
-                    interval_value = ?,
-                    interval_unit = ?,
-                    interval_minutes = ?,
-                    initial_limit = ?,
-                    is_active = ?,
-                    next_fetch_at = ?,
-                    updated_at = ?
-                WHERE id = ?
-                """,
-                (
-                    new_title,
-                    new_custom_title,
-                    new_val,
-                    new_unit,
-                    new_minutes,
-                    new_limit,
-                    1 if new_active else 0,
-                    next_fetch,
-                    now_iso,
-                    site_id,
-                ),
-            )
+            # <--- جدید: اضافه کردن ستون proxy_url در آپدیت
+            if proxy_url is not None:
+                conn.execute(
+                    """
+                    UPDATE sites
+                    SET title = ?,
+                        custom_title = ?,
+                        interval_value = ?,
+                        interval_unit = ?,
+                        interval_minutes = ?,
+                        initial_limit = ?,
+                        is_active = ?,
+                        proxy_url = ?,
+                        next_fetch_at = ?,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        new_title,
+                        new_custom_title,
+                        new_val,
+                        new_unit,
+                        new_minutes,
+                        new_limit,
+                        1 if new_active else 0,
+                        proxy_url,
+                        next_fetch,
+                        now_iso,
+                        site_id,
+                    ),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE sites
+                    SET title = ?,
+                        custom_title = ?,
+                        interval_value = ?,
+                        interval_unit = ?,
+                        interval_minutes = ?,
+                        initial_limit = ?,
+                        is_active = ?,
+                        next_fetch_at = ?,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        new_title,
+                        new_custom_title,
+                        new_val,
+                        new_unit,
+                        new_minutes,
+                        new_limit,
+                        1 if new_active else 0,
+                        next_fetch,
+                        now_iso,
+                        site_id,
+                    ),
+                )
             if new_title != current["title"]:
                 conn.execute(
                     "UPDATE posts SET site_title = ? WHERE site_id = ?",

@@ -955,6 +955,26 @@
                     </label>
                 </div>
 
+                <div class="form-row-2">
+                    <div class="form-group">
+                        <label for="editSiteProxyHost">میزبان پروکسی (اختیاری)</label>
+                        <input id="editSiteProxyHost" type="text" class="form-control" placeholder="مثلاً 127.0.0.1" />
+                    </div>
+                    <div class="form-group">
+                        <label for="editSiteProxyPort">پورت (اختیاری)</label>
+                        <input id="editSiteProxyPort" type="number" class="form-control" placeholder="مثلاً 1080" />
+                    </div>
+                </div>
+
+                <div class="form-group">
+                    <label for="editSiteProxyType">نوع پروکسی</label>
+                    <select id="editSiteProxyType" class="form-control">
+                        <option value="socks5">SOCKS5</option>
+                        <option value="http">HTTP</option>
+                        <option value="https">HTTPS</option>
+                    </select>
+                </div>
+
                 <div class="modal-footer">
                     <button type="button" class="btn btn-ghost" data-close-modal="editSiteModal">انصراف</button>
                     <button type="submit" class="btn btn-primary">ذخیره تغییرات</button>

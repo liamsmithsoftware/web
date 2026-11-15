@@ -13,6 +13,7 @@ class SiteCreateRequest(BaseModel):
     initial_limit: int = Field(default=10, ge=1, le=100, description="تعداد مطالب در اولین دریافت")
     is_active: bool = Field(default=True)
     fetch_now: bool = Field(default=True, description="آیا بلافاصله پس از افزودن، دریافت اولیه انجام شود؟")
+    proxy_url: Optional[str] = Field(default=None, description="پروکسی اختصاصی سطح اپلیکیشن (اختیاری)")
 
 
 class SiteUpdateRequest(BaseModel):
@@ -21,6 +22,7 @@ class SiteUpdateRequest(BaseModel):
     interval_unit: Optional[Literal["minutes", "hours", "days"]] = None
     initial_limit: Optional[int] = Field(default=None, ge=1, le=100)
     is_active: Optional[bool] = None
+    proxy_url: Optional[str] = Field(default=None, description="پروکسی اختصاصی سطح اپلیکیشن (برای تغییر پروکسی سایت)")
 
 
 class SiteResetRequest(BaseModel):
