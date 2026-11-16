@@ -148,13 +148,17 @@ class SyncManager:
             tz_name = settings.get("timezone") or DEFAULT_TIMEZONE
             configured_mode = settings.get("collector_mode") or "auto"
 
+            # روش اتصال اختصاصی این وب‌سایت (پروفایل پروکسی / اتصال مستقیم) روی تنظیمات
+            # عمومی برنامه اعمال می‌شود؛ وب‌سایت‌های بدون پروفایل، همان تنظیمات عمومی را دارند.
+            site_settings = self.db.build_effective_settings(site, settings)
+
             self.db.mark_site_syncing(site_id)
             started = time.perf_counter()
 
             try:
                 batch = await self.web_collector.fetch_site_posts(
                     site=site,
-                    settings=settings,
+                    settings=site_settings,
                 )
                 seen_guids = self.db.get_seen_guids(site_id)
                 selected_newest_first, observed_guids = self.select_new_posts(
@@ -167,7 +171,7 @@ class SyncManager:
                 if selected_newest_first:
                     await self.web_collector.enrich_posts_with_full_content(
                         selected_newest_first,
-                        settings=settings,
+                        settings=site_settings,
                     )
 
                 prepared = self.prepare_posts_for_storage(
@@ -188,6 +192,9 @@ class SyncManager:
             except Exception as exc:
                 elapsed_ms = int((time.perf_counter() - started) * 1000)
                 err_text = str(exc) if isinstance(exc, CollectorError) else f"خطا در دریافت وب‌سایت: {exc}"
+                connection_name = str(site_settings.get("connection_profile_name") or "").strip()
+                if connection_name:
+                    err_text = f"{err_text} (روش اتصال اختصاصی: {connection_name})"
                 return self.db.save_sync_error(
                     site_id=site_id,
                     error_message=err_text,

@@ -51,6 +51,46 @@ async def test_excel_export_is_rtl_and_contains_structured_columns(db):
     assert ws.cell(row=2, column=6).hyperlink is not None
 
 
+async def test_sqlite_export_strips_connection_profile_secrets(db):
+    site_id = await _seed(db)
+    profile = db.create_connection_profile(
+        name="پروکسی اختصاصی",
+        kind="proxy",
+        proxy_type="socks5",
+        proxy_host="127.0.0.1",
+        proxy_port="10808",
+        proxy_username="alice",
+        proxy_password="profile-secret",
+    )
+    db.assign_connection_profile([site_id], int(profile["id"]))
+
+    snap = create_sqlite_export_snapshot(db, strip_sensitive_settings=True)
+    try:
+        conn = sqlite3.connect(str(snap))
+        try:
+            row = conn.execute(
+                "SELECT name, proxy_host, proxy_port, proxy_username, proxy_password "
+                "FROM connection_profiles WHERE id = ?",
+                (int(profile["id"]),),
+            ).fetchone()
+            assert row is not None
+            # ساختار روش اتصال و نسبت‌دادن آن به وب‌سایت حفظ می‌شود، اما اطلاعات احراز هویت پاک می‌شود
+            assert row[0] == "پروکسی اختصاصی"
+            assert row[1] == "127.0.0.1"
+            assert row[2] == "10808"
+            assert row[3] == ""
+            assert row[4] == ""
+            assert "profile-secret" not in str(row)
+            assigned = conn.execute(
+                "SELECT connection_profile_id FROM sites WHERE id = ?", (site_id,)
+            ).fetchone()
+            assert assigned[0] == int(profile["id"])
+        finally:
+            conn.close()
+    finally:
+        snap.unlink(missing_ok=True)
+
+
 async def test_sqlite_export_strips_secrets_and_supports_filtering(db):
     await _seed(db)
     db.update_settings({"proxy_password": "top-secret-password", "custom_cookie": "sid=secret123"})

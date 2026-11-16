@@ -6,6 +6,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Generator, Iterable, List, Optional, Set, Tuple
+from urllib.parse import quote
 
 from app.config import (
     DB_PATH,
@@ -14,10 +15,11 @@ from app.config import (
     DEFAULT_TIMEZONE,
 )
 from app.utils.jalali import format_iso_utc, split_datetime, utc_now, utc_now_iso
-from app.utils.site_parser import ParsedSite, compute_post_guid
+from app.utils.site_parser import ParsedSite, compute_post_guid, normalize_digits
 
 BACKUP_FORMAT_NAME = "website-content-collector-backup"
-BACKUP_FORMAT_VERSION = 1
+# نسخه ۲: بخش «روش‌های اتصال اختصاصی وب‌سایت‌ها» (connection_profiles) به پشتیبان اضافه شد
+BACKUP_FORMAT_VERSION = 2
 
 # تنظیمات حساس که به‌صورت پیش‌فرض در فایل پشتیبان یا خروجی عمومی قرار نمی‌گیرند
 BACKUP_SECRET_SETTING_KEYS = {
@@ -42,6 +44,125 @@ DEFAULT_SETTINGS: Dict[str, str] = {
     "proxy_username": "",
     "proxy_password": "",
 }
+
+# ----------------------------------------------------------------------
+# روش‌های اتصال اختصاصی وب‌سایت‌ها (Connection Profiles)
+# ----------------------------------------------------------------------
+# هر «روش اتصال» یک پروفایل نام‌دار است که می‌تواند به یک یا چند وب‌سایت
+# نسبت داده شود. وب‌سایت‌های بدون پروفایل، همان تنظیمات عمومی برنامه
+# (پروکسی سراسری / پروکسی سیستم‌عامل / اتصال مستقیم) را استفاده می‌کنند.
+CONNECTION_KINDS = ("proxy", "direct")
+CONNECTION_PROXY_TYPES = ("socks5", "http", "https")
+
+# کلیدهایی از پروفایل که در فایل پشتیبان یا پاسخ عمومی API نوشته نمی‌شوند
+CONNECTION_PROFILE_SECRET_FIELDS = ("proxy_password",)
+
+# نشانه «فیلد ارسال نشده» تا از مقدار None (به معنی «پاک کردن») قابل تفکیک باشد
+UNSET = "__unset__"
+
+DEFAULT_CONNECTION_PROFILE: Dict[str, Any] = {
+    "kind": "proxy",
+    "proxy_type": "socks5",
+    "proxy_host": "",
+    "proxy_port": "",
+    "proxy_username": "",
+    "proxy_password": "",
+    "verify_ssl": None,  # None = همان تنظیمات عمومی برنامه
+    "request_timeout": None,  # None = همان تنظیمات عمومی برنامه
+    "fallback_direct": True,
+    "notes": "",
+    "is_enabled": True,
+}
+
+
+def normalize_connection_port(raw: Any) -> str:
+    """پورت پروکسی را به رشته عددی معتبر تبدیل می‌کند (ورودی فارسی هم پذیرفته می‌شود)."""
+    value = normalize_digits(str(raw if raw is not None else "")).strip()
+    if not value:
+        return ""
+    if not value.isdigit() or not (1 <= int(value) <= 65535):
+        raise ValueError("پورت پروکسی باید عددی بین ۱ تا ۶۵۵۳۵ باشد.")
+    return value
+
+
+def build_profile_proxy_url(profile: Optional[Dict[str, Any]]) -> Optional[str]:
+    """ساخت آدرس کامل پروکسی (`scheme://[user:pass@]host:port`) از روی یک پروفایل اتصال."""
+    if not profile:
+        return None
+    if str(profile.get("kind") or "proxy").strip().lower() != "proxy":
+        return None
+
+    host = str(profile.get("proxy_host") or "").strip()
+    port = str(profile.get("proxy_port") or "").strip()
+    if not host or not port:
+        return None
+
+    scheme = str(profile.get("proxy_type") or "socks5").strip().lower()
+    if scheme not in CONNECTION_PROXY_TYPES:
+        scheme = "socks5"
+
+    username = str(profile.get("proxy_username") or "").strip()
+    password = str(profile.get("proxy_password") or "")
+    auth = f"{quote(username, safe='')}:{quote(password, safe='')}@" if username else ""
+    return f"{scheme}://{auth}{host}:{port}"
+
+
+def profile_connection_label(profile: Optional[Dict[str, Any]]) -> str:
+    """برچسب نمایشی کوتاه و بدون اطلاعات محرک (نام کاربری/رمز) برای یک پروفایل اتصال."""
+    if not profile:
+        return ""
+    kind = str(profile.get("kind") or "proxy").strip().lower()
+    if kind == "direct":
+        return "اتصال مستقیم (بدون پروکسی)"
+
+    host = str(profile.get("proxy_host") or "").strip()
+    port = str(profile.get("proxy_port") or "").strip()
+    scheme = str(profile.get("proxy_type") or "socks5").strip().lower()
+    if not host or not port:
+        return "پروکسی (تنظیمات ناقص)"
+    label = f"{scheme}://{host}:{port}"
+    if str(profile.get("proxy_username") or "").strip():
+        label += " (با نام کاربری)"
+    return label
+
+
+def mask_proxy_url(proxy_url: Optional[str]) -> str:
+    """حذف نام کاربری و رمز از آدرس پروکسی برای نمایش ایمن در رابط کاربری و گزارش‌ها."""
+    raw = str(proxy_url or "").strip()
+    if not raw or "@" not in raw or "://" not in raw:
+        return raw
+    scheme, _, rest = raw.partition("://")
+    _, _, host_part = rest.rpartition("@")
+    return f"{scheme}://{host_part}"
+
+
+def site_connection_label(site: Optional[Dict[str, Any]]) -> str:
+    """توضیح روش اتصال مؤثر یک وب‌سایت (پروفایل اختصاصی، پروکسی دستی قدیمی یا حالت عمومی)."""
+    if not site:
+        return ""
+    profile_name = str(site.get("connection_profile_name") or "").strip()
+    if profile_name:
+        label = str(site.get("connection_profile_label") or "").strip()
+        suffix = "" if site.get("connection_profile_enabled", True) else " (غیرفعال)"
+        return f"{profile_name} — {label}{suffix}" if label else f"{profile_name}{suffix}"
+    manual = mask_proxy_url(site.get("proxy_url"))
+    if manual:
+        return f"پروکسی دستی — {manual}"
+    return "حالت عمومی برنامه"
+
+
+# ستون‌های نمایشی «روش اتصال» که به هر ردیف وب‌سایت چسبانده می‌شود
+# (رمز پروکسی عمداً انتخاب نمی‌شود تا هرگز به مرورگر نرسد)
+SITE_CONNECTION_COLUMNS = """
+                    cp.name AS connection_profile_name,
+                    cp.kind AS connection_profile_kind,
+                    cp.is_enabled AS connection_profile_enabled,
+                    cp.proxy_type AS connection_proxy_type,
+                    cp.proxy_host AS connection_proxy_host,
+                    cp.proxy_port AS connection_proxy_port,
+                    cp.proxy_username AS connection_proxy_username
+"""
+
 
 
 def compute_interval_minutes(interval_value: float, interval_unit: str) -> int:
@@ -101,10 +222,79 @@ class DatabaseManager:
             finally:
                 conn.close()
 
+    @staticmethod
+    def _ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) -> bool:
+        """افزودن ستون جدید به جدول موجود (Migration سبک و بدون حذف داده)."""
+        cur = conn.execute(f"PRAGMA table_info({table})")
+        existing = {row["name"] for row in cur.fetchall()}
+        if column in existing:
+            return False
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+        return True
+
+    def _migrate_schema(self, conn: sqlite3.Connection) -> None:
+        """هم‌سان‌سازی ساختار دیتابیس نسخه‌های قدیمی‌تر با نسخه فعلی."""
+        # پروکسی دستی هر وب‌سایت (ستون قدیمی — همچنان پشتیبانی می‌شود)
+        self._ensure_column(conn, "sites", "proxy_url", "TEXT")
+        # روش اتصال (پروفایل) اختصاصی هر وب‌سایت
+        self._ensure_column(
+            conn,
+            "sites",
+            "connection_profile_id",
+            "INTEGER REFERENCES connection_profiles(id) ON DELETE SET NULL",
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sites_connection_profile "
+            "ON sites(connection_profile_id)"
+        )
+
+        # ستون‌های جدید جدول پروفایل‌های اتصال (برای دیتابیس‌های قدیمی‌تر)
+        profile_columns = {
+            "kind": "TEXT NOT NULL DEFAULT 'proxy'",
+            "proxy_type": "TEXT NOT NULL DEFAULT 'socks5'",
+            "proxy_host": "TEXT NOT NULL DEFAULT ''",
+            "proxy_port": "TEXT NOT NULL DEFAULT ''",
+            "proxy_username": "TEXT NOT NULL DEFAULT ''",
+            "proxy_password": "TEXT NOT NULL DEFAULT ''",
+            "verify_ssl": "TEXT",
+            "request_timeout": "TEXT",
+            "fallback_direct": "INTEGER NOT NULL DEFAULT 1",
+            "notes": "TEXT NOT NULL DEFAULT ''",
+            "is_enabled": "INTEGER NOT NULL DEFAULT 1",
+            "last_test_at": "TEXT",
+            "last_test_ok": "INTEGER",
+            "last_test_message": "TEXT",
+        }
+        for column, ddl in profile_columns.items():
+            self._ensure_column(conn, "connection_profiles", column, ddl)
+
     def init_db(self) -> None:
         with self.transaction() as conn:
             conn.executescript(
                 """
+                -- روش‌های اتصال اختصاصی (پروکسی نام‌دار) که به یک یا چند وب‌سایت نسبت داده می‌شوند.
+                -- وب‌سایت‌هایی که پروفایل ندارند از تنظیمات عمومی برنامه استفاده می‌کنند.
+                CREATE TABLE IF NOT EXISTS connection_profiles (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL UNIQUE,
+                    kind TEXT NOT NULL DEFAULT 'proxy',          -- 'proxy' | 'direct'
+                    proxy_type TEXT NOT NULL DEFAULT 'socks5',   -- 'socks5' | 'http' | 'https'
+                    proxy_host TEXT NOT NULL DEFAULT '',
+                    proxy_port TEXT NOT NULL DEFAULT '',
+                    proxy_username TEXT NOT NULL DEFAULT '',
+                    proxy_password TEXT NOT NULL DEFAULT '',
+                    verify_ssl TEXT,            -- NULL = همان تنظیمات عمومی برنامه
+                    request_timeout TEXT,       -- NULL = همان تنظیمات عمومی برنامه
+                    fallback_direct INTEGER NOT NULL DEFAULT 1,
+                    notes TEXT NOT NULL DEFAULT '',
+                    is_enabled INTEGER NOT NULL DEFAULT 1,
+                    last_test_at TEXT,
+                    last_test_ok INTEGER,
+                    last_test_message TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS sites (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     site_key TEXT NOT NULL UNIQUE,
@@ -132,7 +322,8 @@ class DatabaseManager:
                     last_error TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
-                    proxy_url TEXT  -- <--- جدید: ستون پروکسی اختصاصی در سطح اپلیکیشن
+                    proxy_url TEXT,  -- پروکسی دستی قدیمی (سازگاری با نسخه‌های قبل)
+                    connection_profile_id INTEGER REFERENCES connection_profiles(id) ON DELETE SET NULL
                 );
 
                 CREATE TABLE IF NOT EXISTS posts (
@@ -217,11 +408,8 @@ class DatabaseManager:
                 ORDER BY p.published_at_utc DESC, p.item_seq DESC;
                 """
             )
-            # <--- جدید: بررسی و اضافه کردن ستون proxy_url در صورت فقدان (Migration)
-            cur = conn.execute("PRAGMA table_info(sites)")
-            columns = [row["name"] for row in cur.fetchall()]
-            if "proxy_url" not in columns:
-                conn.execute("ALTER TABLE sites ADD COLUMN proxy_url TEXT")
+            # Migration: افزودن ستون‌های جدید (پروکسی دستی و پروفایل اتصال) به دیتابیس‌های قدیمی
+            self._migrate_schema(conn)
 
             for k, v in DEFAULT_SETTINGS.items():
                 conn.execute(
@@ -254,6 +442,503 @@ class DatabaseManager:
         return self.get_settings()
 
     # ------------------------------------------------------------------
+    # Connection Profiles (روش‌های اتصال اختصاصی وب‌سایت‌ها)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _profile_row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
+        profile = dict(row)
+        profile["kind"] = str(profile.get("kind") or "proxy").lower()
+        profile["is_enabled"] = bool(profile.get("is_enabled"))
+        profile["fallback_direct"] = bool(profile.get("fallback_direct"))
+        profile["proxy_password_set"] = bool(str(profile.get("proxy_password") or ""))
+        profile["proxy_url"] = build_profile_proxy_url(profile)
+        profile["connection_label"] = profile_connection_label(profile)
+        profile["verify_ssl"] = (
+            None if profile.get("verify_ssl") in (None, "") else str(profile.get("verify_ssl")) == "1"
+        )
+        timeout_raw = profile.get("request_timeout")
+        try:
+            profile["request_timeout"] = int(timeout_raw) if timeout_raw not in (None, "") else None
+        except (TypeError, ValueError):
+            profile["request_timeout"] = None
+        profile["last_test_ok"] = (
+            None if profile.get("last_test_ok") is None else bool(profile.get("last_test_ok"))
+        )
+        return profile
+
+    @staticmethod
+    def public_profile(profile: Dict[str, Any]) -> Dict[str, Any]:
+        """پاسخ امن API: رمز پروکسی هرگز به مرورگر فرستاده نمی‌شود."""
+        out = {k: v for k, v in profile.items() if k not in CONNECTION_PROFILE_SECRET_FIELDS}
+        # اگر ورودی از قبل عمومی (بدون رمز) بوده، همان پرچم قبلی حفظ می‌شود
+        out["proxy_password_set"] = (
+            bool(profile["proxy_password"])
+            if "proxy_password" in profile
+            else bool(profile.get("proxy_password_set"))
+        )
+        out["proxy_url"] = mask_proxy_url(profile.get("proxy_url"))
+        return out
+
+    def list_connection_profiles(self, *, include_secrets: bool = False) -> List[Dict[str, Any]]:
+        with self.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    cp.*,
+                    COUNT(s.id) AS assigned_sites
+                FROM connection_profiles cp
+                LEFT JOIN sites s ON s.connection_profile_id = cp.id
+                GROUP BY cp.id
+                ORDER BY cp.id ASC
+                """
+            ).fetchall()
+        profiles = [self._profile_row_to_dict(r) for r in rows]
+        return [
+            p if include_secrets else self.public_profile(p)
+            for p in profiles
+        ]
+
+    def get_connection_profile(
+        self, profile_id: int, *, include_secrets: bool = True
+    ) -> Optional[Dict[str, Any]]:
+        with self.connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM connection_profiles WHERE id = ?", (int(profile_id),)
+            ).fetchone()
+        if not row:
+            return None
+        profile = self._profile_row_to_dict(row)
+        return profile if include_secrets else self.public_profile(profile)
+
+    def get_connection_profile_by_name(
+        self, name: str, *, include_secrets: bool = True
+    ) -> Optional[Dict[str, Any]]:
+        clean = str(name or "").strip().lower()
+        if not clean:
+            return None
+        with self.connection() as conn:
+            row = conn.execute(
+                "SELECT id FROM connection_profiles WHERE LOWER(name) = ?", (clean,)
+            ).fetchone()
+        return self.get_connection_profile(int(row["id"]), include_secrets=include_secrets) if row else None
+
+    def _validate_profile_fields(
+        self,
+        *,
+        name: Optional[str] = None,
+        kind: Optional[str] = None,
+        proxy_type: Optional[str] = None,
+        proxy_host: Optional[str] = None,
+        proxy_port: Optional[Any] = None,
+        verify_ssl: Any = UNSET,
+        request_timeout: Any = UNSET,
+    ) -> Dict[str, Any]:
+        clean: Dict[str, Any] = {}
+
+        if name is not None:
+            clean_name = str(name).strip()
+            if not clean_name:
+                raise ValueError("نام روش اتصال نمی‌تواند خالی باشد.")
+            if len(clean_name) > 80:
+                raise ValueError("نام روش اتصال نمی‌تواند بیشتر از ۸۰ نویسه باشد.")
+            clean["name"] = clean_name
+
+        if kind is not None:
+            clean_kind = str(kind).strip().lower()
+            if clean_kind not in CONNECTION_KINDS:
+                raise ValueError("نوع روش اتصال باید «پروکسی» یا «اتصال مستقیم» باشد.")
+            clean["kind"] = clean_kind
+
+        if proxy_type is not None:
+            clean_type = str(proxy_type).strip().lower()
+            if clean_type == "socks":
+                clean_type = "socks5"
+            if clean_type not in CONNECTION_PROXY_TYPES:
+                raise ValueError("نوع پروکسی باید یکی از SOCKS5، HTTP یا HTTPS باشد.")
+            clean["proxy_type"] = clean_type
+
+        if proxy_host is not None:
+            host = str(proxy_host).strip()
+            # حذف پیشوند scheme در صورتی که کاربر آدرس کامل را وارد کرده باشد
+            if "://" in host:
+                scheme, _, rest = host.partition("://")
+                scheme = scheme.strip().lower()
+                if scheme in CONNECTION_PROXY_TYPES and "proxy_type" not in clean:
+                    clean["proxy_type"] = scheme
+                host = rest
+            host = host.split("/", 1)[0].strip()
+            if "@" in host:  # user:pass@host — جداسازی اطلاعات احراز هویت
+                auth, _, host = host.rpartition("@")
+                if ":" in auth and "proxy_username" not in clean:
+                    user, _, pwd = auth.partition(":")
+                    clean["proxy_username"] = user.strip()
+                    clean["proxy_password"] = pwd
+            if len(host) > 253:
+                raise ValueError("آدرس میزبان پروکسی معتبر نیست.")
+            clean["proxy_host"] = host
+
+        if proxy_port is not None:
+            clean["proxy_port"] = normalize_connection_port(proxy_port)
+
+        if clean.get("kind") == "proxy":
+            host_value = clean.get("proxy_host")
+            port_value = clean.get("proxy_port")
+            if (host_value is not None and not host_value) or (
+                port_value is not None and not port_value
+            ):
+                raise ValueError("برای روش اتصال پروکسی، وارد کردن آدرس میزبان و پورت الزامی است.")
+
+        if verify_ssl != UNSET:
+            clean["verify_ssl"] = None if verify_ssl is None else ("1" if verify_ssl else "0")
+
+        if request_timeout != UNSET:
+            if request_timeout is None or str(request_timeout).strip() == "":
+                clean["request_timeout"] = None
+            else:
+                try:
+                    timeout_value = int(float(str(request_timeout).strip()))
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("مهلت زمانی باید عددی بین ۵ تا ۱۲۰ ثانیه باشد.") from exc
+                if not 5 <= timeout_value <= 120:
+                    raise ValueError("مهلت زمانی باید عددی بین ۵ تا ۱۲۰ ثانیه باشد.")
+                clean["request_timeout"] = str(timeout_value)
+
+        return clean
+
+    def create_connection_profile(
+        self,
+        *,
+        name: str,
+        kind: str = "proxy",
+        proxy_type: str = "socks5",
+        proxy_host: str = "",
+        proxy_port: Any = "",
+        proxy_username: str = "",
+        proxy_password: str = "",
+        verify_ssl: Any = UNSET,
+        request_timeout: Any = UNSET,
+        fallback_direct: bool = True,
+        notes: str = "",
+        is_enabled: bool = True,
+    ) -> Dict[str, Any]:
+        clean = self._validate_profile_fields(
+            name=name,
+            kind=kind,
+            proxy_type=proxy_type,
+            proxy_host=proxy_host,
+            proxy_port=proxy_port,
+            verify_ssl=verify_ssl,
+            request_timeout=request_timeout,
+        )
+        resolved_kind = clean["kind"]
+        if resolved_kind == "proxy" and (not clean.get("proxy_host") or not clean.get("proxy_port")):
+            raise ValueError("برای روش اتصال پروکسی، وارد کردن آدرس میزبان و پورت الزامی است.")
+
+        now_iso = utc_now_iso()
+        with self.transaction() as conn:
+            exists = conn.execute(
+                "SELECT id FROM connection_profiles WHERE LOWER(name) = LOWER(?)",
+                (clean["name"],),
+            ).fetchone()
+            if exists:
+                raise ValueError("روش اتصالی با این نام قبلاً ثبت شده است.")
+
+            cur = conn.execute(
+                """
+                INSERT INTO connection_profiles (
+                    name, kind, proxy_type, proxy_host, proxy_port,
+                    proxy_username, proxy_password, verify_ssl, request_timeout,
+                    fallback_direct, notes, is_enabled, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    clean["name"],
+                    resolved_kind,
+                    clean.get("proxy_type") or "socks5",
+                    clean.get("proxy_host") or "",
+                    clean.get("proxy_port") or "",
+                    str(proxy_username or "").strip(),
+                    str(proxy_password or "") if proxy_password is not None else "",
+                    clean.get("verify_ssl"),
+                    clean.get("request_timeout"),
+                    1 if fallback_direct else 0,
+                    str(notes or "").strip()[:500],
+                    1 if is_enabled else 0,
+                    now_iso,
+                    now_iso,
+                ),
+            )
+            profile_id = int(cur.lastrowid)
+
+        profile = self.get_connection_profile(profile_id)
+        assert profile is not None
+        return profile
+
+    def update_connection_profile(
+        self,
+        profile_id: int,
+        *,
+        name: Optional[str] = None,
+        kind: Optional[str] = None,
+        proxy_type: Optional[str] = None,
+        proxy_host: Optional[str] = None,
+        proxy_port: Any = None,
+        proxy_username: Optional[str] = None,
+        proxy_password: Optional[str] = None,
+        verify_ssl: Any = UNSET,
+        request_timeout: Any = UNSET,
+        fallback_direct: Optional[bool] = None,
+        notes: Optional[str] = None,
+        is_enabled: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        current = self.get_connection_profile(int(profile_id))
+        if not current:
+            raise LookupError("روش اتصال مورد نظر یافت نشد.")
+
+        clean = self._validate_profile_fields(
+            name=name,
+            kind=kind,
+            proxy_type=proxy_type,
+            proxy_host=proxy_host,
+            proxy_port=proxy_port,
+            verify_ssl=verify_ssl,
+            request_timeout=request_timeout,
+        )
+
+        new_kind = clean.get("kind", current["kind"])
+        new_host = clean.get("proxy_host", current.get("proxy_host") or "")
+        new_port = clean.get("proxy_port", current.get("proxy_port") or "")
+        if new_kind == "proxy" and (not str(new_host).strip() or not str(new_port).strip()):
+            raise ValueError("برای روش اتصال پروکسی، وارد کردن آدرس میزبان و پورت الزامی است.")
+
+        new_name = clean.get("name", current["name"])
+        if str(new_name).lower() != str(current["name"]).lower():
+            duplicate = self.get_connection_profile_by_name(new_name)
+            if duplicate and int(duplicate["id"]) != int(profile_id):
+                raise ValueError("روش اتصالی با این نام قبلاً ثبت شده است.")
+
+        updates: Dict[str, Any] = {
+            "name": new_name,
+            "kind": new_kind,
+            "proxy_type": clean.get("proxy_type", current.get("proxy_type") or "socks5"),
+            "proxy_host": new_host,
+            "proxy_port": new_port,
+            "proxy_username": (
+                str(proxy_username).strip() if proxy_username is not None
+                else str(current.get("proxy_username") or "")
+            ),
+            "fallback_direct": (
+                1 if fallback_direct else 0
+            ) if fallback_direct is not None else (1 if current.get("fallback_direct") else 0),
+            "notes": str(notes).strip()[:500] if notes is not None else str(current.get("notes") or ""),
+            "is_enabled": (
+                1 if is_enabled else 0
+            ) if is_enabled is not None else (1 if current.get("is_enabled") else 0),
+            "updated_at": utc_now_iso(),
+        }
+
+        # رمز پروکسی: مقدار «********» یعنی «بدون تغییر» (همان قرارداد بخش تنظیمات عمومی)
+        if proxy_password is not None and proxy_password != "********":
+            updates["proxy_password"] = str(proxy_password)
+        else:
+            updates["proxy_password"] = str(current.get("proxy_password") or "")
+
+        updates["verify_ssl"] = (
+            clean["verify_ssl"] if "verify_ssl" in clean
+            else (
+                None if current.get("verify_ssl") is None
+                else ("1" if current.get("verify_ssl") else "0")
+            )
+        )
+        updates["request_timeout"] = (
+            clean["request_timeout"] if "request_timeout" in clean
+            else (
+                None if current.get("request_timeout") is None
+                else str(current.get("request_timeout"))
+            )
+        )
+
+        columns = ", ".join(f"{key} = ?" for key in updates)
+        with self.transaction() as conn:
+            conn.execute(
+                f"UPDATE connection_profiles SET {columns} WHERE id = ?",
+                (*updates.values(), int(profile_id)),
+            )
+
+        updated = self.get_connection_profile(int(profile_id))
+        assert updated is not None
+        return updated
+
+    def delete_connection_profile(self, profile_id: int) -> bool:
+        """حذف روش اتصال؛ وب‌سایت‌های وابسته به‌صورت خودکار به حالت عمومی برمی‌گردند."""
+        with self.transaction() as conn:
+            conn.execute(
+                "UPDATE sites SET connection_profile_id = NULL, updated_at = ? "
+                "WHERE connection_profile_id = ?",
+                (utc_now_iso(), int(profile_id)),
+            )
+            cur = conn.execute("DELETE FROM connection_profiles WHERE id = ?", (int(profile_id),))
+            return cur.rowcount > 0
+
+    def record_connection_profile_test(
+        self, profile_id: int, *, ok: bool, message: str
+    ) -> None:
+        with self.transaction() as conn:
+            conn.execute(
+                """
+                UPDATE connection_profiles
+                SET last_test_at = ?, last_test_ok = ?, last_test_message = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (utc_now_iso(), 1 if ok else 0, str(message or "")[:500], utc_now_iso(), int(profile_id)),
+            )
+
+    def assign_connection_profile(
+        self,
+        site_ids: Iterable[int],
+        profile_id: Optional[int],
+        *,
+        clear_manual_proxy: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        نسبت‌دادن یک روش اتصال به یک یا چند وب‌سایت.
+
+        `profile_id = None` یعنی بازگرداندن وب‌سایت‌ها به «حالت عمومی برنامه».
+        وب‌سایت‌هایی که در این فراخوانی انتخاب نشده‌اند هیچ تغییری نمی‌کنند.
+        """
+        ids = []
+        seen: Set[int] = set()
+        for raw_id in site_ids or []:
+            try:
+                sid = int(raw_id)
+            except (TypeError, ValueError):
+                continue
+            if sid in seen:
+                continue
+            seen.add(sid)
+            ids.append(sid)
+
+        if not ids:
+            raise ValueError("هیچ وب‌سایتی برای اعمال روش اتصال انتخاب نشده است.")
+
+        profile = None
+        if profile_id is not None:
+            profile = self.get_connection_profile(int(profile_id))
+            if not profile:
+                raise LookupError("روش اتصال انتخاب‌شده یافت نشد.")
+            if profile["kind"] == "proxy" and not profile.get("proxy_url"):
+                raise ValueError(
+                    "این روش اتصال پروکسی، آدرس میزبان یا پورت ندارد؛ ابتدا آن را ویرایش و کامل کنید."
+                )
+
+        now_iso = utc_now_iso()
+        placeholders = ", ".join("?" for _ in ids)
+        with self.transaction() as conn:
+            rows = conn.execute(
+                f"SELECT id, title FROM sites WHERE id IN ({placeholders})", ids
+            ).fetchall()
+            found = {int(r["id"]): r["title"] for r in rows}
+            missing = [sid for sid in ids if sid not in found]
+            if missing:
+                raise LookupError(
+                    f"وب‌سایت(های) با شناسه {', '.join(str(m) for m in missing)} یافت نشد."
+                )
+
+            if clear_manual_proxy and profile is not None:
+                conn.execute(
+                    f"""
+                    UPDATE sites
+                    SET connection_profile_id = ?,
+                        proxy_url = NULL,
+                        updated_at = ?
+                    WHERE id IN ({placeholders})
+                    """,
+                    (int(profile["id"]), now_iso, *ids),
+                )
+            else:
+                conn.execute(
+                    f"""
+                    UPDATE sites
+                    SET connection_profile_id = ?,
+                        updated_at = ?
+                    WHERE id IN ({placeholders})
+                    """,
+                    (int(profile["id"]) if profile else None, now_iso, *ids),
+                )
+
+        return {
+            "profile_id": int(profile["id"]) if profile else None,
+            "profile_name": profile["name"] if profile else None,
+            "connection_label": profile["connection_label"] if profile else "حالت عمومی برنامه",
+            "updated_sites": len(ids),
+            "site_ids": ids,
+            "site_titles": [found[sid] for sid in ids],
+        }
+
+    def get_sites_connection_summary(self) -> Dict[str, Any]:
+        """خلاصه وضعیت روش اتصال وب‌سایت‌ها برای نمایش در رابط کاربری."""
+        sites = self.list_sites()
+        profiles = self.list_connection_profiles()
+        assigned = [s for s in sites if s.get("connection_profile_id")]
+        manual = [
+            s for s in sites
+            if not s.get("connection_profile_id") and str(s.get("proxy_url") or "").strip()
+        ]
+        return {
+            "total_sites": len(sites),
+            "assigned_sites": len(assigned),
+            "manual_proxy_sites": len(manual),
+            "general_mode_sites": len(sites) - len(assigned) - len(manual),
+            "profiles": len(profiles),
+        }
+
+    def build_effective_settings(
+        self,
+        site: Dict[str, Any],
+        settings: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, str]:
+        """
+        ساخت تنظیمات مؤثر شبکه برای یک وب‌سایت خاص:
+
+        ۱. اگر وب‌سایت «روش اتصال» (پروفایل) داشته باشد → همان پروکسی/اتصال مستقیم استفاده می‌شود
+           (به‌همراه بازنویسی اختیاری SSL و مهلت زمانی).
+        ۲. در غیر این صورت اگر پروکسی دستی قدیمی (`sites.proxy_url`) تنظیم شده باشد → همان استفاده می‌شود.
+        ۳. در غیر این صورت → تنظیمات عمومی برنامه (پروکسی سراسری یا پروکسی سیستم‌عامل) بدون تغییر می‌ماند.
+        """
+        effective: Dict[str, str] = dict(settings if settings is not None else self.get_settings())
+
+        profile: Optional[Dict[str, Any]] = None
+        profile_id = site.get("connection_profile_id") if site else None
+        if profile_id:
+            profile = self.get_connection_profile(int(profile_id))
+            if profile and not profile.get("is_enabled"):
+                profile = None  # پروفایل غیرفعال → رفتار همان حالت عمومی
+
+        if profile:
+            if profile["kind"] == "direct":
+                effective["site_force_direct"] = "1"
+                effective.pop("site_proxy_url", None)
+            else:
+                proxy_url = build_profile_proxy_url(profile)
+                if proxy_url:
+                    effective["site_proxy_url"] = proxy_url
+                    effective["site_force_direct"] = "0"
+                    effective["site_proxy_no_fallback"] = "0" if profile.get("fallback_direct") else "1"
+
+            if profile.get("verify_ssl") is not None:
+                effective["verify_ssl"] = "1" if profile.get("verify_ssl") else "0"
+            if profile.get("request_timeout"):
+                effective["request_timeout"] = str(profile["request_timeout"])
+            effective["connection_profile_name"] = str(profile.get("name") or "")
+            return effective
+
+        manual_proxy = str((site or {}).get("proxy_url") or "").strip()
+        if manual_proxy:
+            effective["site_proxy_url"] = manual_proxy
+            effective["site_force_direct"] = "0"
+        return effective
+
+    # ------------------------------------------------------------------
     # Websites (Sites) CRUD
     # ------------------------------------------------------------------
     def create_site(
@@ -265,11 +950,21 @@ class DatabaseManager:
         title: Optional[str] = None,
         is_active: bool = True,
         is_demo: bool = False,
-        proxy_url: Optional[str] = None,  # <--- جدید: پروکسی اختصاصی در سطح اپلیکیشن
+        proxy_url: Optional[str] = None,  # پروکسی دستی (سازگاری با نسخه‌های قبل)
+        connection_profile_id: Optional[int] = None,  # روش اتصال اختصاصی وب‌سایت
     ) -> Dict[str, Any]:
         interval_minutes = compute_interval_minutes(interval_value, interval_unit)
         if initial_limit < 1 or initial_limit > 100:
             raise ValueError("تعداد مطالب دریافت اولیه باید بین ۱ تا ۱۰۰ باشد.")
+
+        resolved_profile_id: Optional[int] = None
+        if connection_profile_id not in (None, ""):
+            try:
+                resolved_profile_id = int(connection_profile_id)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("شناسه روش اتصال معتبر نیست.") from exc
+            if not self.get_connection_profile(resolved_profile_id, include_secrets=False):
+                raise LookupError("روش اتصال انتخاب‌شده یافت نشد.")
 
         now_dt = utc_now()
         now_iso = format_iso_utc(now_dt)
@@ -291,8 +986,9 @@ class DatabaseManager:
                     site_key, site_input, domain, canonical_url, feed_url,
                     title, custom_title, is_direct_feed, interval_value, interval_unit,
                     interval_minutes, initial_limit, is_active, is_demo, proxy_url,
+                    connection_profile_id,
                     next_fetch_at, last_status, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
                 """,
                 (
                     parsed.site_key,
@@ -309,7 +1005,8 @@ class DatabaseManager:
                     int(initial_limit),
                     1 if is_active else 0,
                     1 if is_demo else 0,
-                    proxy_url,  # <--- جدید: پروکسی اختصاصی
+                    proxy_url,  # پروکسی دستی قدیمی
+                    resolved_profile_id,  # روش اتصال اختصاصی
                     next_iso,
                     now_iso,
                     now_iso,
@@ -321,21 +1018,52 @@ class DatabaseManager:
         assert site is not None
         return site
 
+    @staticmethod
+    def _decorate_site_row(row: sqlite3.Row) -> Dict[str, Any]:
+        """افزودن فیلدهای نمایشی «روش اتصال» به ردیف وب‌سایت (بدون افشای رمز پروکسی)."""
+        site = dict(row)
+        has_profile = bool(site.get("connection_profile_id")) and bool(
+            site.get("connection_profile_name")
+        )
+        site["connection_profile_enabled"] = (
+            bool(site.get("connection_profile_enabled")) if has_profile else None
+        )
+        site["connection_profile_label"] = (
+            profile_connection_label(
+                {
+                    "kind": site.get("connection_profile_kind"),
+                    "proxy_type": site.get("connection_proxy_type"),
+                    "proxy_host": site.get("connection_proxy_host"),
+                    "proxy_port": site.get("connection_proxy_port"),
+                    "proxy_username": site.get("connection_proxy_username"),
+                }
+            )
+            if has_profile
+            else ""
+        )
+        if not has_profile:
+            site["connection_profile_name"] = None
+        site["proxy_url_masked"] = mask_proxy_url(site.get("proxy_url"))
+        site["connection_label"] = site_connection_label(site)
+        return site
+
     def get_site(self, site_id: int) -> Optional[Dict[str, Any]]:
         with self.connection() as conn:
             row = conn.execute(
-                """
+                f"""
                 SELECT
                     s.*,
-                    COUNT(p.id) AS posts_count
+                    COUNT(p.id) AS posts_count,
+                    {SITE_CONNECTION_COLUMNS}
                 FROM sites s
                 LEFT JOIN posts p ON p.site_id = s.id
+                LEFT JOIN connection_profiles cp ON cp.id = s.connection_profile_id
                 WHERE s.id = ?
                 GROUP BY s.id
                 """,
                 (site_id,),
             ).fetchone()
-        return dict(row) if row else None
+        return self._decorate_site_row(row) if row else None
 
     def get_site_by_key(self, site_key: str) -> Optional[Dict[str, Any]]:
         with self.connection() as conn:
@@ -349,17 +1077,19 @@ class DatabaseManager:
     def list_sites(self) -> List[Dict[str, Any]]:
         with self.connection() as conn:
             rows = conn.execute(
-                """
+                f"""
                 SELECT
                     s.*,
-                    COUNT(p.id) AS posts_count
+                    COUNT(p.id) AS posts_count,
+                    {SITE_CONNECTION_COLUMNS}
                 FROM sites s
                 LEFT JOIN posts p ON p.site_id = s.id
+                LEFT JOIN connection_profiles cp ON cp.id = s.connection_profile_id
                 GROUP BY s.id
                 ORDER BY s.id DESC
                 """
             ).fetchall()
-        return [dict(r) for r in rows]
+        return [self._decorate_site_row(r) for r in rows]
 
     def update_site(
         self,
@@ -370,7 +1100,8 @@ class DatabaseManager:
         interval_unit: Optional[str] = None,
         initial_limit: Optional[int] = None,
         is_active: Optional[bool] = None,
-        proxy_url: Optional[str] = None,  # <--- جدید: تغییر پروکسی در سطح اپلیکیشن
+        proxy_url: Optional[str] = None,  # None = بدون تغییر، "" = پاک کردن پروکسی دستی
+        connection_profile_id: Any = UNSET,  # UNSET = بدون تغییر، None = حالت عمومی، int = پروفایل
     ) -> Dict[str, Any]:
         current = self.get_site(site_id)
         if not current:
@@ -407,66 +1138,45 @@ class DatabaseManager:
             else:
                 next_fetch = format_iso_utc(now_dt + timedelta(minutes=new_minutes))
 
-        with self.transaction() as conn:
-            # <--- جدید: اضافه کردن ستون proxy_url در آپدیت
-            if proxy_url is not None:
-                conn.execute(
-                    """
-                    UPDATE sites
-                    SET title = ?,
-                        custom_title = ?,
-                        interval_value = ?,
-                        interval_unit = ?,
-                        interval_minutes = ?,
-                        initial_limit = ?,
-                        is_active = ?,
-                        proxy_url = ?,
-                        next_fetch_at = ?,
-                        updated_at = ?
-                    WHERE id = ?
-                    """,
-                    (
-                        new_title,
-                        new_custom_title,
-                        new_val,
-                        new_unit,
-                        new_minutes,
-                        new_limit,
-                        1 if new_active else 0,
-                        proxy_url,
-                        next_fetch,
-                        now_iso,
-                        site_id,
-                    ),
-                )
+        updates: Dict[str, Any] = {
+            "title": new_title,
+            "custom_title": new_custom_title,
+            "interval_value": new_val,
+            "interval_unit": new_unit,
+            "interval_minutes": new_minutes,
+            "initial_limit": new_limit,
+            "is_active": 1 if new_active else 0,
+            "next_fetch_at": next_fetch,
+            "updated_at": now_iso,
+        }
+
+        # پروکسی دستی (فیلد قدیمی): None = بدون تغییر، رشته خالی = پاک کردن
+        if proxy_url is not None:
+            clean_proxy = str(proxy_url).strip()
+            updates["proxy_url"] = clean_proxy or None
+
+        # روش اتصال اختصاصی (پروفایل)
+        if connection_profile_id is not UNSET:
+            if connection_profile_id is None or str(connection_profile_id).strip() == "":
+                updates["connection_profile_id"] = None
             else:
-                conn.execute(
-                    """
-                    UPDATE sites
-                    SET title = ?,
-                        custom_title = ?,
-                        interval_value = ?,
-                        interval_unit = ?,
-                        interval_minutes = ?,
-                        initial_limit = ?,
-                        is_active = ?,
-                        next_fetch_at = ?,
-                        updated_at = ?
-                    WHERE id = ?
-                    """,
-                    (
-                        new_title,
-                        new_custom_title,
-                        new_val,
-                        new_unit,
-                        new_minutes,
-                        new_limit,
-                        1 if new_active else 0,
-                        next_fetch,
-                        now_iso,
-                        site_id,
-                    ),
-                )
+                try:
+                    pid = int(connection_profile_id)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("شناسه روش اتصال معتبر نیست.") from exc
+                profile = self.get_connection_profile(pid, include_secrets=False)
+                if not profile:
+                    raise LookupError("روش اتصال انتخاب‌شده یافت نشد.")
+                updates["connection_profile_id"] = pid
+                # وقتی روش اتصال اختصاصی فعال است، پروکسی دستی قدیمی پاک می‌شود تا تداخل نکند
+                updates["proxy_url"] = None
+
+        columns = ", ".join(f"{key} = ?" for key in updates)
+        with self.transaction() as conn:
+            conn.execute(
+                f"UPDATE sites SET {columns} WHERE id = ?",
+                (*updates.values(), site_id),
+            )
             if new_title != current["title"]:
                 conn.execute(
                     "UPDATE posts SET site_title = ? WHERE site_id = ?",
@@ -1134,8 +1844,31 @@ class DatabaseManager:
                     "last_post_guid": s.get("last_post_guid"),
                     "last_status": s.get("last_status"),
                     "created_at": s.get("created_at"),
+                    # روش اتصال اختصاصی وب‌سایت (با نام پروفایل تا در سیستم مقصد قابل بازسازی باشد)
+                    "connection_profile": s.get("connection_profile_name"),
+                    "proxy_url": mask_proxy_url(s.get("proxy_url")) or None,
                 }
             )
+
+        # روش‌های اتصال (پروفایل‌های پروکسی) — بدون رمز مگر آنکه کاربر صراحتاً بخواهد
+        profiles_payload: List[Dict[str, Any]] = []
+        for profile in self.list_connection_profiles(include_secrets=True):
+            entry = {
+                "name": profile.get("name"),
+                "kind": profile.get("kind"),
+                "proxy_type": profile.get("proxy_type"),
+                "proxy_host": profile.get("proxy_host"),
+                "proxy_port": profile.get("proxy_port"),
+                "proxy_username": profile.get("proxy_username"),
+                "verify_ssl": profile.get("verify_ssl"),
+                "request_timeout": profile.get("request_timeout"),
+                "fallback_direct": bool(profile.get("fallback_direct")),
+                "notes": profile.get("notes"),
+                "is_enabled": bool(profile.get("is_enabled")),
+            }
+            if include_secrets:
+                entry["proxy_password"] = profile.get("proxy_password") or ""
+            profiles_payload.append(entry)
 
         payload: Dict[str, Any] = {
             "format": BACKUP_FORMAT_NAME,
@@ -1146,9 +1879,11 @@ class DatabaseManager:
             "counts": {
                 "sites": len(sites_payload),
                 "settings": 0,
+                "connection_profiles": len(profiles_payload),
             },
             "sites": sites_payload,
             "settings": {},
+            "connection_profiles": profiles_payload,
         }
 
         if include_settings:
@@ -1156,7 +1891,7 @@ class DatabaseManager:
             payload["settings"] = backup_settings
             payload["counts"]["settings"] = len(backup_settings)
 
-        payload["secrets_included"] = bool(include_settings and include_secrets)
+        payload["secrets_included"] = bool(include_secrets)
         return payload
 
     @staticmethod
@@ -1185,6 +1920,12 @@ class DatabaseManager:
         if not isinstance(settings, dict):
             raise ValueError("بخش «تنظیمات» در فایل پشتیبان معتبر نیست.")
 
+        profiles = data.get("connection_profiles")
+        if profiles is None:
+            profiles = []
+        if not isinstance(profiles, list):
+            raise ValueError("بخش «روش‌های اتصال» در فایل پشتیبان معتبر نیست.")
+
         clean_sites: List[Dict[str, Any]] = []
         for index, raw in enumerate(sites, start=1):
             if not isinstance(raw, dict):
@@ -1194,6 +1935,15 @@ class DatabaseManager:
                 raise ValueError(f"وب‌سایت شماره {index} آدرس اینترنتی ندارد.")
             clean_sites.append({**raw, "site_input": target})
 
+        clean_profiles: List[Dict[str, Any]] = []
+        for index, raw in enumerate(profiles, start=1):
+            if not isinstance(raw, dict):
+                raise ValueError(f"روش اتصال شماره {index} در فایل پشتیبان معتبر نیست.")
+            name = str(raw.get("name") or "").strip()
+            if not name:
+                raise ValueError(f"روش اتصال شماره {index} نام ندارد.")
+            clean_profiles.append({**raw, "name": name})
+
         return {
             "format": BACKUP_FORMAT_NAME,
             "format_version": version,
@@ -1201,6 +1951,7 @@ class DatabaseManager:
             "note": data.get("note") or "",
             "sites": clean_sites,
             "settings": settings,
+            "connection_profiles": clean_profiles,
         }
 
     def restore_from_backup(
@@ -1224,6 +1975,8 @@ class DatabaseManager:
             "skipped_sites": 0,
             "removed_sites": 0,
             "restored_settings": 0,
+            "restored_profiles": 0,
+            "assigned_profiles": 0,
             "cursor_restored": 0,
             "errors": [],
             "warnings": [],
@@ -1231,6 +1984,48 @@ class DatabaseManager:
 
         if mode == "replace":
             report["removed_sites"] = int(self.clear_all_sites())
+
+        # بازگردانی «روش‌های اتصال اختصاصی» (پروفایل‌های پروکسی) پیش از وب‌سایت‌ها
+        profile_ids_by_name: Dict[str, int] = {}
+        for raw_profile in payload.get("connection_profiles") or []:
+            profile_name = str(raw_profile.get("name") or "").strip()
+            if not profile_name:
+                continue
+
+            has_secret = bool(str(raw_profile.get("proxy_password") or ""))
+            existing_profile = self.get_connection_profile_by_name(profile_name)
+            fields: Dict[str, Any] = {
+                "kind": str(raw_profile.get("kind") or "proxy"),
+                "proxy_type": str(raw_profile.get("proxy_type") or "socks5"),
+                "proxy_host": str(raw_profile.get("proxy_host") or ""),
+                "proxy_port": raw_profile.get("proxy_port") or "",
+                "proxy_username": str(raw_profile.get("proxy_username") or ""),
+                # اگر رمز در فایل نبود، رمز فعلی دست‌نخورده می‌ماند (قرارداد «********»)
+                "proxy_password": str(raw_profile.get("proxy_password") or "")
+                if has_secret or not existing_profile
+                else "********",
+                "verify_ssl": raw_profile.get("verify_ssl")
+                if "verify_ssl" in raw_profile
+                else UNSET,
+                "request_timeout": raw_profile.get("request_timeout")
+                if "request_timeout" in raw_profile
+                else UNSET,
+                "fallback_direct": bool(raw_profile.get("fallback_direct", True)),
+                "notes": str(raw_profile.get("notes") or ""),
+                "is_enabled": bool(raw_profile.get("is_enabled", True)),
+            }
+
+            try:
+                if existing_profile:
+                    saved_profile = self.update_connection_profile(
+                        int(existing_profile["id"]), name=profile_name, **fields
+                    )
+                else:
+                    saved_profile = self.create_connection_profile(name=profile_name, **fields)
+                    report["restored_profiles"] += 1
+                profile_ids_by_name[profile_name.lower()] = int(saved_profile["id"])
+            except (ValueError, LookupError) as exc:
+                report["errors"].append(f"روش اتصال «{profile_name}»: {exc}")
 
         for raw in payload["sites"]:
             try:
@@ -1301,6 +2096,24 @@ class DatabaseManager:
                     conn.execute(
                         "UPDATE sites SET feed_url = ? WHERE id = ? AND feed_url IS NULL",
                         (str(raw["feed_url"]).strip(), site_id),
+                    )
+
+            # بازگردانی نسبت‌دادن «روش اتصال اختصاصی» به این وب‌سایت
+            wanted_profile = str(raw.get("connection_profile") or "").strip()
+            if wanted_profile:
+                restored_profile_id = profile_ids_by_name.get(wanted_profile.lower())
+                if restored_profile_id:
+                    try:
+                        self.update_site(site_id, connection_profile_id=restored_profile_id)
+                        report["assigned_profiles"] += 1
+                    except (ValueError, LookupError) as exc:
+                        report["warnings"].append(
+                            f"{parsed.site_key}: روش اتصال «{wanted_profile}» اعمال نشد ({exc})"
+                        )
+                else:
+                    report["warnings"].append(
+                        f"{parsed.site_key}: روش اتصال «{wanted_profile}» در فایل پشتیبان معتبر نبود "
+                        "و وب‌سایت در حالت عمومی باقی ماند."
                     )
 
             # بازگردانی نشانگر آخرین مطلب فقط اگر مطالب آن وب‌سایت در آرشیو موجود باشد

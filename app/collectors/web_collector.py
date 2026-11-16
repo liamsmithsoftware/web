@@ -351,19 +351,22 @@ class WebSiteCollector:
         if not canonical_url:
             raise CollectorError("آدرس وب‌سایت نامعتبر یا خالی است.")
 
-        # <--- جدید: سطح اپلیکیشن (پایگاه داده) اولویت دارد، سپس پروفایل
+        # روش اتصال اختصاصی وب‌سایت:
+        # ۱) اگر تنظیمات مؤثر (ساخته‌شده توسط SyncManager از پروفایل اتصال) رسیده باشد، همان اعمال می‌شود.
+        # ۲) در غیر این صورت پروکسی دستی قدیمی (`sites.proxy_url`) بررسی می‌شود.
+        # ۳) و در نهایت پروفایل داخلی (hard-coded) سایت‌های خاص.
         fetcher_settings = dict(settings)
-        
-        # ۱. بررسی تنظیمات سطح اپلیکیشن (از جدول sites در پایگاه داده)
-        # سایت در `site` دارای کلید `proxy_url` است (اگر در جدول وجود داشته باشد)
-        site_proxy_from_db = site.get("proxy_url")
-        if site_proxy_from_db:
-            fetcher_settings["site_proxy_url"] = site_proxy_from_db
-        else:
-            # ۲. بررسی پروفایل سایت (اگر در پایگاه داده نباشد)
-            profile = get_site_profile(canonical_url)
-            if profile and profile.proxy_url:
-                fetcher_settings["site_proxy_url"] = profile.proxy_url
+        already_resolved = bool(fetcher_settings.get("site_proxy_url")) or (
+            str(fetcher_settings.get("site_force_direct") or "") == "1"
+        )
+        if not already_resolved:
+            manual_proxy = str(site.get("proxy_url") or "").strip()
+            if manual_proxy:
+                fetcher_settings["site_proxy_url"] = manual_proxy
+            else:
+                profile = get_site_profile(canonical_url)
+                if profile and profile.proxy_url:
+                    fetcher_settings["site_proxy_url"] = profile.proxy_url
 
         fetcher = SmartHttpFetcher(fetcher_settings)
 

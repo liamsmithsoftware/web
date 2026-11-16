@@ -146,7 +146,9 @@ def resolve_proxy_candidates(
     """
     Returns ordered list of (proxy_url, is_explicit_user_proxy).
     - Never uses a proxy for localhost / 127.0.0.1 targets.
-    - Checks site-specific proxy (site_proxy_url) if provided in settings.
+    - Site-specific connection method wins over the global proxy settings:
+        * `site_force_direct` = "1"  -> always a plain direct connection (no global/OS proxy)
+        * `site_proxy_url`            -> that proxy is used for this website only
     - For domestic `.ir` sites (e.g. `ipis.ir`, `mfa.gov.ir`, `isna.ir`), tries direct
       connection (`None`) FIRST because Iranian ministry/domestic firewalls frequently
       drop or block foreign VPN IPs, keeping the proxy as secondary fallback.
@@ -155,8 +157,11 @@ def resolve_proxy_candidates(
     if _is_loopback_target(target_url):
         return [(None, False)]
 
-    # <--- جدید: بررسی پروکسی اختصاصی سایت
-    site_proxy = settings.get("site_proxy_url")
+    # روش اتصال اختصاصی این وب‌سایت (پروفایل اتصال یا پروکسی دستی) بر تنظیمات عمومی مقدم است
+    if str(settings.get("site_force_direct") or "") == "1" and not settings.get("site_proxy_url"):
+        return [(None, False)]
+
+    site_proxy = str(settings.get("site_proxy_url") or "").strip()
     if site_proxy:
         return [(site_proxy, True)]
 
@@ -274,7 +279,9 @@ class SmartHttpFetcher:
         candidates = list(resolve_proxy_candidates(self.settings, url))
         # Also allow direct rescue if explicit proxy succeeded at TCP level but got 403/522 IP block
         has_explicit = len(candidates) == 1 and candidates[0][1] is True and candidates[0][0] is not None
-        if has_explicit:
+        # A per-site connection profile can opt out of the direct rescue route
+        site_only = str(self.settings.get("site_proxy_no_fallback") or "") == "1"
+        if has_explicit and not site_only:
             candidates.append((None, False))
 
         primary_resp: Optional[HttpFetchResponse] = None

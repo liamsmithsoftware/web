@@ -59,6 +59,8 @@ class FakeWebSiteCollector:
         self.title = title
         self.source_mode = source_mode
         self.calls: List[Dict[str, Any]] = []
+        self.enrich_calls: List[Dict[str, str]] = []
+        self.probe_calls: List[Dict[str, Any]] = []
 
     def set_posts(self, posts: List[FetchedPost]) -> None:
         """Accepts posts in any order and exposes them newest-first (by published_at desc)."""
@@ -74,7 +76,12 @@ class FakeWebSiteCollector:
         site: Dict[str, Any],
         settings: Dict[str, str],
     ) -> FetchBatchResult:
-        self.calls.append({"canonical_url": site.get("canonical_url")})
+        self.calls.append(
+            {
+                "canonical_url": site.get("canonical_url"),
+                "settings": dict(settings),
+            }
+        )
         return FetchBatchResult(
             site_title=self.title,
             posts=list(self.posts),
@@ -89,6 +96,7 @@ class FakeWebSiteCollector:
         posts: List[FetchedPost],
         settings: Dict[str, str],
     ) -> List[FetchedPost]:
+        self.enrich_calls.append(dict(settings))
         return posts
 
     async def probe_site(
@@ -98,6 +106,8 @@ class FakeWebSiteCollector:
     ) -> Dict[str, Any]:
         from app.collectors.base import CollectorError
         from app.utils.site_parser import parse_site_input
+
+        self.probe_calls.append({"raw_url": raw_url, "settings": dict(settings)})
 
         try:
             parsed = parse_site_input(raw_url)

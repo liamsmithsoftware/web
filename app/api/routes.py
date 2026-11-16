@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import re
+import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -10,10 +12,14 @@ from fastapi.responses import FileResponse, Response
 from app.collectors.base import CollectorError
 from app.collectors.manager import SyncManager
 from app.config import DEFAULT_REQUEST_TIMEOUT, DEFAULT_TIMEZONE
-from app.database import DatabaseManager
+from app.database import UNSET, DatabaseManager, mask_proxy_url
 from app.schemas import (
     BackupRestoreRequest,
     BulkDeleteRequest,
+    ConnectionProfileAssignRequest,
+    ConnectionProfileCreateRequest,
+    ConnectionProfileTestRequest,
+    ConnectionProfileUpdateRequest,
     PurgeRequest,
     SettingsUpdateRequest,
     SiteCreateRequest,
@@ -56,6 +62,15 @@ def _enrich_site(site: Dict[str, Any], tz_name: str) -> Dict[str, Any]:
     out["last_fetched_display"] = format_local_display(site.get("last_fetched_at"), tz_name=tz_name)
     out["next_fetch_display"] = format_local_display(site.get("next_fetch_at"), tz_name=tz_name)
     out["last_post_display"] = format_local_display(site.get("last_post_at"), tz_name=tz_name)
+    # روش اتصال: نام پروفایل اختصاصی + برچسب ایمن (بدون نام کاربری/رمز پروکسی)
+    out["connection_profile_id"] = site.get("connection_profile_id")
+    out["connection_profile_name"] = site.get("connection_profile_name")
+    out["connection_profile_label"] = site.get("connection_profile_label") or ""
+    out["connection_label"] = site.get("connection_label") or "حالت عمومی برنامه"
+    out["connection_is_general"] = not bool(site.get("connection_profile_id")) and not str(
+        site.get("proxy_url") or ""
+    ).strip()
+    out["proxy_url"] = mask_proxy_url(site.get("proxy_url")) or None
     return out
 
 
@@ -215,7 +230,10 @@ async def create_site(payload: SiteCreateRequest, request: Request) -> Dict[str,
             title=payload.title,
             is_active=payload.is_active,
             proxy_url=payload.proxy_url,
+            connection_profile_id=payload.connection_profile_id,
         )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -237,10 +255,26 @@ async def probe_site_endpoint(payload: SiteProbeRequest, request: Request) -> Di
     db = _get_db(request)
     sync_manager = _get_sync_manager(request)
     settings = db.get_settings()
+
+    connection_label = "حالت عمومی برنامه"
+    if payload.connection_profile_id:
+        profile = db.get_connection_profile(
+            int(payload.connection_profile_id), include_secrets=False
+        )
+        if not profile:
+            raise HTTPException(status_code=404, detail="روش اتصال انتخاب‌شده یافت نشد.")
+        settings = db.build_effective_settings(
+            {"connection_profile_id": int(profile["id"])}, settings
+        )
+        connection_label = f"{profile['name']} — {profile['connection_label']}"
+
     try:
-        return await sync_manager.web_collector.probe_site(payload.site_input, settings=settings)
+        result = await sync_manager.web_collector.probe_site(payload.site_input, settings=settings)
     except CollectorError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    result["connection_label"] = connection_label
+    return result
 
 
 @router.put("/sites/{site_id}")
@@ -251,6 +285,13 @@ async def update_site(
 ) -> Dict[str, Any]:
     db = _get_db(request)
     tz_name = db.get_settings().get("timezone") or DEFAULT_TIMEZONE
+
+    # «روش اتصال» فقط وقتی تغییر می‌کند که صراحتاً در درخواست فرستاده شده باشد
+    # (null صریح = بازگشت وب‌سایت به حالت عمومی برنامه)
+    connection_profile_id: Any = UNSET
+    if "connection_profile_id" in payload.model_fields_set:
+        connection_profile_id = payload.connection_profile_id
+
     try:
         updated = db.update_site(
             site_id,
@@ -260,6 +301,7 @@ async def update_site(
             initial_limit=payload.initial_limit,
             is_active=payload.is_active,
             proxy_url=payload.proxy_url,
+            connection_profile_id=connection_profile_id,
         )
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -553,6 +595,14 @@ def _run_restore(db: DatabaseManager, data: Any, options: Dict[str, Any]) -> Dic
         summary_bits.append(f"{to_persian_number(report['removed_sites'])} وب‌سایت قبلی حذف شد")
     if report["restored_settings"]:
         summary_bits.append(f"{to_persian_number(report['restored_settings'])} تنظیم اعمال شد")
+    if report.get("restored_profiles"):
+        summary_bits.append(
+            f"{to_persian_number(report['restored_profiles'])} روش اتصال جدید ثبت شد"
+        )
+    if report.get("assigned_profiles"):
+        summary_bits.append(
+            f"روش اتصال برای {to_persian_number(report['assigned_profiles'])} وب‌سایت اعمال شد"
+        )
     if report["skipped_sites"]:
         summary_bits.append(f"{to_persian_number(report['skipped_sites'])} مورد نامعتبر نادیده گرفته شد")
 
@@ -769,6 +819,277 @@ async def export_sqlite(
 
 
 # ------------------------------------------------------------------
+# Connection Profiles (روش‌های اتصال اختصاصی وب‌سایت‌ها)
+# ------------------------------------------------------------------
+# سرویس سبک و عمومی برای «تست اتصال»: IP خروجی را برمی‌گرداند تا کاربر بتواند
+# مطمئن شود درخواست‌ها واقعاً از پروکسی انتخاب‌شده عبور می‌کنند.
+CONNECTION_TEST_DEFAULT_TARGET = "https://api.ipify.org/?format=json"
+_IP_PATTERN = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+
+
+def _extract_exit_ip(text: str) -> Optional[str]:
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+        if isinstance(data, dict):
+            for key in ("ip", "origin", "query", "ip_addr"):
+                value = data.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+    except (ValueError, TypeError):
+        pass
+    match = _IP_PATTERN.search(raw[:512])
+    return match.group(0) if match else None
+
+
+@router.get("/connection-profiles")
+async def list_connection_profiles(request: Request) -> Dict[str, Any]:
+    """فهرست روش‌های اتصال تعریف‌شده به‌همراه وب‌سایت‌های متصل‌شده به هر کدام."""
+    db = _get_db(request)
+    tz_name = db.get_settings().get("timezone") or DEFAULT_TIMEZONE
+
+    profiles = db.list_connection_profiles()
+    sites = [_enrich_site(s, tz_name) for s in db.list_sites()]
+    sites_by_profile: Dict[int, List[Dict[str, Any]]] = {}
+    for site in sites:
+        pid = site.get("connection_profile_id")
+        if pid:
+            sites_by_profile.setdefault(int(pid), []).append(
+                {
+                    "id": site["id"],
+                    "title": site.get("title"),
+                    "canonical_url": site.get("canonical_url"),
+                    "is_active": site.get("is_active"),
+                }
+            )
+
+    for profile in profiles:
+        profile["assigned_site_list"] = sites_by_profile.get(int(profile["id"]), [])
+        if profile.get("last_test_at"):
+            profile["last_test_display"] = format_local_display(
+                profile["last_test_at"], tz_name=tz_name
+            )
+
+    return {
+        "items": profiles,
+        "summary": db.get_sites_connection_summary(),
+        "sites": [
+            {
+                "id": s["id"],
+                "title": s.get("title"),
+                "domain": s.get("domain"),
+                "canonical_url": s.get("canonical_url"),
+                "is_active": s.get("is_active"),
+                "is_demo": s.get("is_demo"),
+                "posts_count": s.get("posts_count"),
+                "connection_profile_id": s.get("connection_profile_id"),
+                "connection_profile_name": s.get("connection_profile_name"),
+                "connection_label": s.get("connection_label"),
+                "connection_is_general": s.get("connection_is_general"),
+                "proxy_url": s.get("proxy_url"),
+            }
+            for s in sites
+        ],
+    }
+
+
+@router.post("/connection-profiles/assign")
+async def assign_connection_profile(
+    payload: ConnectionProfileAssignRequest, request: Request
+) -> Dict[str, Any]:
+    """
+    اعمال یک روش اتصال روی یک یا چند وب‌سایت انتخاب‌شده.
+
+    وب‌سایت‌هایی که انتخاب نشده‌اند بدون تغییر می‌مانند و از تنظیمات عمومی برنامه
+    (پروکسی سراسری یا اتصال مستقیم) استفاده می‌کنند.
+    """
+    db = _get_db(request)
+    tz_name = db.get_settings().get("timezone") or DEFAULT_TIMEZONE
+
+    if not payload.site_ids:
+        raise HTTPException(
+            status_code=400,
+            detail="ابتدا دست‌کم یک وب‌سایت را از فهرست انتخاب کنید.",
+        )
+
+    try:
+        result = db.assign_connection_profile(
+            payload.site_ids,
+            payload.profile_id,
+            clear_manual_proxy=payload.clear_manual_proxy,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    count_fa = to_persian_number(result["updated_sites"])
+    if result["profile_id"]:
+        message = (
+            f"روش اتصال «{result['profile_name']}» برای {count_fa} وب‌سایت اعمال شد. "
+            "از دریافت بعدی، این وب‌سایت‌ها فقط از همین پروکسی استفاده می‌کنند."
+        )
+    else:
+        message = (
+            f"{count_fa} وب‌سایت به «حالت عمومی برنامه» بازگشت و از تنظیمات پروکسی عمومی استفاده می‌کند."
+        )
+
+    return {
+        **result,
+        "message": message,
+        "sites": [
+            _enrich_site(s, tz_name)
+            for s in db.list_sites()
+            if int(s["id"]) in set(result["site_ids"])
+        ],
+        "summary": db.get_sites_connection_summary(),
+    }
+
+
+@router.post("/connection-profiles")
+async def create_connection_profile(
+    payload: ConnectionProfileCreateRequest, request: Request
+) -> Dict[str, Any]:
+    db = _get_db(request)
+    try:
+        profile = db.create_connection_profile(
+            name=payload.name,
+            kind=payload.kind,
+            proxy_type=payload.proxy_type,
+            proxy_host=payload.proxy_host,
+            proxy_port=payload.proxy_port if payload.proxy_port is not None else "",
+            proxy_username=payload.proxy_username or "",
+            proxy_password=payload.proxy_password or "",
+            verify_ssl=payload.verify_ssl,
+            request_timeout=payload.request_timeout,
+            fallback_direct=payload.fallback_direct,
+            notes=payload.notes,
+            is_enabled=payload.is_enabled,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return {
+        "profile": db.public_profile(profile),
+        "message": f"روش اتصال «{profile['name']}» ثبت شد. اکنون می‌توانید آن را به وب‌سایت‌های دلخواه نسبت دهید.",
+    }
+
+
+@router.put("/connection-profiles/{profile_id}")
+async def update_connection_profile(
+    profile_id: int, payload: ConnectionProfileUpdateRequest, request: Request
+) -> Dict[str, Any]:
+    db = _get_db(request)
+    provided = payload.model_fields_set
+
+    kwargs: Dict[str, Any] = {}
+    for field in (
+        "name",
+        "kind",
+        "proxy_type",
+        "proxy_host",
+        "proxy_username",
+        "proxy_password",
+        "fallback_direct",
+        "notes",
+        "is_enabled",
+    ):
+        if field in provided:
+            kwargs[field] = getattr(payload, field)
+    if "proxy_port" in provided:
+        kwargs["proxy_port"] = payload.proxy_port if payload.proxy_port is not None else ""
+    if "verify_ssl" in provided:
+        kwargs["verify_ssl"] = payload.verify_ssl
+    if "request_timeout" in provided:
+        kwargs["request_timeout"] = payload.request_timeout
+
+    try:
+        profile = db.update_connection_profile(profile_id, **kwargs)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return {
+        "profile": db.public_profile(profile),
+        "message": f"روش اتصال «{profile['name']}» به‌روزرسانی شد و از دریافت بعدی اعمال می‌شود.",
+    }
+
+
+@router.delete("/connection-profiles/{profile_id}")
+async def delete_connection_profile(profile_id: int, request: Request) -> Dict[str, Any]:
+    db = _get_db(request)
+    profile = db.get_connection_profile(profile_id, include_secrets=False)
+    if not profile:
+        raise HTTPException(status_code=404, detail="روش اتصال مورد نظر یافت نشد.")
+
+    db.delete_connection_profile(profile_id)
+    return {
+        "deleted": True,
+        "profile_id": profile_id,
+        "summary": db.get_sites_connection_summary(),
+        "message": (
+            f"روش اتصال «{profile['name']}» حذف شد و وب‌سایت‌های متصل به آن "
+            "به حالت عمومی برنامه بازگشتند."
+        ),
+    }
+
+
+@router.post("/connection-profiles/{profile_id}/test")
+async def test_connection_profile(
+    profile_id: int, payload: ConnectionProfileTestRequest, request: Request
+) -> Dict[str, Any]:
+    """تست واقعی روش اتصال: یک درخواست سبک از طریق همان پروکسی ارسال می‌شود."""
+    from app.collectors.http_fetcher import SmartHttpFetcher
+
+    db = _get_db(request)
+    profile = db.get_connection_profile(profile_id)
+    if not profile:
+        raise HTTPException(status_code=404, detail="روش اتصال مورد نظر یافت نشد.")
+
+    target = str(payload.target_url or "").strip() or CONNECTION_TEST_DEFAULT_TARGET
+    if not target.lower().startswith(("http://", "https://")):
+        target = f"https://{target}"
+
+    settings = db.build_effective_settings({"connection_profile_id": int(profile["id"])}, db.get_settings())
+    started = time.perf_counter()
+    ok = False
+    status_code: Optional[int] = None
+    exit_ip: Optional[str] = None
+    try:
+        fetcher = SmartHttpFetcher(settings, allow_browser_fallback=False)
+        response = await fetcher.get(target, accept_kind="json")
+        status_code = int(response.status_code)
+        exit_ip = _extract_exit_ip(response.text)
+        ok = 200 <= status_code < 400
+        message = (
+            f"اتصال موفق از طریق «{profile['name']}» — کد وضعیت HTTP {status_code}"
+            + (f"، IP خروجی: {exit_ip}" if exit_ip else "")
+        )
+    except CollectorError as exc:
+        message = f"خطای اتصال از طریق «{profile['name']}»: {exc}"
+    except Exception as exc:  # noqa: BLE001 — هر خطای شبکه باید به کاربر گزارش شود
+        message = f"خطای اتصال از طریق «{profile['name']}»: {exc}"
+
+    elapsed_ms = int((time.perf_counter() - started) * 1000)
+    db.record_connection_profile_test(int(profile["id"]), ok=ok, message=message)
+
+    refreshed = db.get_connection_profile(int(profile["id"]), include_secrets=False)
+    return {
+        "ok": ok,
+        "profile": db.public_profile(refreshed or profile),
+        "target_url": target,
+        "status_code": status_code,
+        "exit_ip": exit_ip,
+        "elapsed_ms": elapsed_ms,
+        "connection_label": profile.get("connection_label"),
+        "message": message,
+    }
+
+
+# ------------------------------------------------------------------
 # Settings
 # ------------------------------------------------------------------
 @router.get("/settings")
@@ -792,7 +1113,8 @@ async def get_settings_endpoint(request: Request) -> Dict[str, Any]:
             "proxy_port": raw.get("proxy_port", ""),
             "proxy_username": raw.get("proxy_username", ""),
             "proxy_password_set": bool(raw.get("proxy_password")),
-        }
+        },
+        "connection_summary": db.get_sites_connection_summary(),
     }
 
 

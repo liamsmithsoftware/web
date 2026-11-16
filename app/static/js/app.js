@@ -30,72 +30,16 @@ const state = {
         media_type: "all",
     },
     selectedPostIds: new Set(),
-    editingSite    // <--- جدید: اختصاص پروکسی به انتخاب‌ها
-    const btnApplyProxyMulti = document.getElementById("btnApplyProxyMulti");
-    const proxyMultiSelect = document.getElementById("proxyMultiSiteSelect");
-    const proxyMultiHost = document.getElementById("proxyMultiHost");
-    const proxyMultiPort = document.getElementById("proxyMultiPort");
-    const proxyMultiType = document.getElementById("proxyMultiType");
-
-    if (btnApplyProxyMulti && proxyMultiSelect) {
-        btnApplyProxyMulti.addEventListener("click", async () => {
-            const selectedIds = Array.from(proxyMultiSelect.selectedOptions).map(opt => opt.value);
-            if (selectedIds.length === 0) {
-                showToast("لطفاً حداقل یک وب‌سایت را انتخاب کنید.", "error");
-                return;
-            }
-
-            const host = proxyMultiHost.value.trim();
-            const port = proxyMultiPort.value.trim();
-            const type = proxyMultiType.value;
-            const proxyUrl = (host && port) ? `${type}://${host}:${port}` : null;
-
-            const promises = selectedIds.map(async (id) => {
-                try {
-                    await apiFetch(`/api/sites/${id}`, {
-                        method: "PUT",
-                        body: { proxy_url: proxyUrl },
-                    });
-                } catch (err) {
-                    showToast(`خطا در آپدیت وب‌سایت ${id}: ${err.message}`, "error");
-                }
-            });
-
-            await Promise.all(promises);
-            showToast(`پروکسی برای ${selectedIds.length} وب‌سایت اعمال شد.`, "success");
-            await Promise.all([loadSites(), loadOverview()]);
-            
-            // پاک کردن انتخاب‌ها و فیلدها
-            proxyMultiSelect.selectedIndex = -1;
-            proxyMultiHost.value = "";
-            proxyMultiPort.value = "";
-            proxyMultiType.value = "socks5";
-        });
-
-        // پر کردن لیست انتخاب سایت‌ها هنگام رندر سایت‌ها
-        const renderProxySelect = () => {
-            proxyMultiSelect.innerHTML = '<option value="">انتخاب وب‌سایت...</option>';
-            state.sites.forEach(s => {
-                const opt = document.createElement("option");
-                opt.value = s.id;
-                opt.textContent = `${s.title} (${s.site_key})`;
-                proxyMultiSelect.appendChild(opt);
-            });
-        };
-        
-        // فراخوانی پس از هر بار رندر سایت‌ها
-        const originalRenderSites = window.renderSites;
-        window.renderSites = (...args) => {
-            originalRenderSites(...args);
-            renderProxySelect();
-        };
-    }
-
-    const tbody = document.getElementById("sitesTableBody");
-    if (tbody) {
-    Id: null,
+    editingSiteId: null,
     activeModalPost: null,
     overviewTimer: null,
+    // روش‌های اتصال اختصاصی وب‌سایت‌ها (پروکسی per-site)
+    connectionProfiles: [],
+    connectionSites: [],
+    connectionSummary: {},
+    editingProfileId: null,
+    connectionSiteFilter: "",
+    connectionSelectedSites: new Set(),
 };
 
 const MEDIA_LABELS = {
@@ -364,6 +308,21 @@ function statusBadge(site) {
     return '<span class="badge badge-ok">فعال و پایش‌شده</span>';
 }
 
+/** برچسب کوچک «روش اتصال اختصاصی» برای جدول وب‌سایت‌ها */
+function connectionBadgeHtml(site) {
+    if (site && site.connection_profile_name) {
+        return `<span class="badge badge-proxy" title="روش اتصال اختصاصی: ${escapeHtml(
+            site.connection_label || ""
+        )}">پروکسی اختصاصی</span>`;
+    }
+    if (site && site.proxy_url) {
+        return `<span class="badge badge-proxy badge-proxy-manual" title="پروکسی دستی: ${escapeHtml(
+            site.proxy_url
+        )}">پروکسی دستی</span>`;
+    }
+    return "";
+}
+
 function normalizeSearchText(value) {
     if (value === null || value === undefined) return "";
     return String(value)
@@ -550,6 +509,7 @@ function renderSites() {
             const feedBadge = site.feed_url
                 ? `<span class="badge badge-feed" title="فید شناسایی‌شده: ${escapeHtml(site.feed_url)}">RSS</span>`
                 : "";
+            const connectionBadge = connectionBadgeHtml(site);
             const errorHint = site.last_error
                 ? `<div class="error-hint" title="${escapeHtml(site.last_error)}">${escapeHtml(
                       String(site.last_error).slice(0, 90)
@@ -560,10 +520,13 @@ function renderSites() {
             <tr>
                 <td>
                     <div class="ch-title-wrap">
-                        <span class="ch-title">${escapeHtml(site.title)} ${demoBadge}${feedBadge}</span>
+                        <span class="ch-title">${escapeHtml(site.title)} ${demoBadge}${feedBadge}${connectionBadge}</span>
                         <a class="ch-link ltr-text" href="${escapeHtml(site.canonical_url)}" target="_blank" rel="noopener noreferrer" title="${escapeHtml(site.canonical_url)}">
                             ${escapeHtml(site.canonical_url)}
                         </a>
+                        <div class="ch-connection" title="روش اتصال این وب‌سایت برای دریافت مطالب">
+                            روش اتصال: ${escapeHtml(site.connection_label || "حالت عمومی برنامه")}
+                        </div>
                     </div>
                 </td>
                 <td>${intervalLabelFa(site.interval_value, site.interval_unit)}</td>
@@ -599,6 +562,22 @@ async function loadSites() {
         state.sites = data.items || [];
         renderSites();
         populateSiteFilters();
+        // همگام‌سازی فهرست وب‌سایت‌ها در بخش «روش اتصال اختصاصی» (زبانه تنظیمات)
+        state.connectionSites = state.sites.map((s) => ({
+            id: s.id,
+            title: s.title,
+            domain: s.domain,
+            canonical_url: s.canonical_url,
+            is_active: s.is_active,
+            is_demo: s.is_demo,
+            posts_count: s.posts_count,
+            connection_profile_id: s.connection_profile_id,
+            connection_profile_name: s.connection_profile_name,
+            connection_label: s.connection_label,
+            proxy_url: s.proxy_url,
+        }));
+        renderConnectionSiteList();
+        updateConnectionSelectionUI();
     } catch (err) {
         showToast(err.message, "error");
     }
@@ -722,22 +701,28 @@ function openEditModal(siteId) {
     document.getElementById("editIntervalUnit").value = site.interval_unit;
     document.getElementById("editInitialLimit").value = site.initial_limit;
     document.getElementById("editSiteActive").checked = Boolean(site.is_active);
-    
-    // Populate Proxy URL fields
-    if (site.proxy_url) {
-        const parts = site.proxy_url.split("://");
-        const type = parts[0] || "socks5";
-        const hostPort = parts[1] || "";
-        const [host, port] = hostPort.split(":");
-        document.getElementById("editSiteProxyHost").value = host || "";
-        document.getElementById("editSiteProxyPort").value = port || "";
-        document.getElementById("editSiteProxyType").value = type;
-    } else {
-        document.getElementById("editSiteProxyHost").value = "";
-        document.getElementById("editSiteProxyPort").value = "";
-        document.getElementById("editSiteProxyType").value = "socks5";
+
+    // روش اتصال اختصاصی (پروفایل) این وب‌سایت
+    const profileSelect = document.getElementById("editSiteConnectionProfile");
+    if (profileSelect) {
+        fillConnectionProfileSelect(profileSelect, {
+            placeholder: "حالت عمومی برنامه (پروکسی سراسری یا اتصال مستقیم)",
+        });
+        profileSelect.value = site.connection_profile_id ? String(site.connection_profile_id) : "";
     }
-    
+
+    // پروکسی دستی قدیمی (فقط زمانی که پروفایل اختصاصی نسبت داده نشده باشد)
+    const manualProxy = !site.connection_profile_id && site.proxy_url ? String(site.proxy_url) : "";
+    const parts = manualProxy.split("://");
+    const type = parts.length === 2 ? parts[0] : "socks5";
+    const hostPort = parts.length === 2 ? parts[1] : "";
+    const [host, port] = hostPort.split(":");
+    document.getElementById("editSiteProxyHost").value = host || "";
+    document.getElementById("editSiteProxyPort").value = port || "";
+    document.getElementById("editSiteProxyType").value = ["socks5", "http", "https"].includes(type)
+        ? type
+        : "socks5";
+
     document.getElementById("editSiteModal").classList.remove("hidden");
 }
 
@@ -749,10 +734,13 @@ function initEditForm() {
         const id = document.getElementById("editSiteId").value;
         if (!id) return;
 
+        const profileValue = (document.getElementById("editSiteConnectionProfile")?.value || "").trim();
+
         const proxyHost = document.getElementById("editSiteProxyHost")?.value.trim() || "";
         const proxyPort = document.getElementById("editSiteProxyPort")?.value.trim() || "";
         const proxyType = document.getElementById("editSiteProxyType")?.value || "socks5";
-        const proxyUrl = (proxyHost && proxyPort) ? `${proxyType}://${proxyHost}:${proxyPort}` : null;
+        // رشته خالی = پاک‌کردن پروکسی دستی (اگر روش اتصال اختصاصی انتخاب شده باشد هم پاک می‌شود)
+        const proxyUrl = !profileValue && proxyHost && proxyPort ? `${proxyType}://${proxyHost}:${proxyPort}` : "";
 
         const payload = {
             title: document.getElementById("editSiteTitle").value.trim(),
@@ -761,13 +749,15 @@ function initEditForm() {
             initial_limit: Number(document.getElementById("editInitialLimit").value),
             is_active: document.getElementById("editSiteActive").checked,
             proxy_url: proxyUrl,
+            // null صریح = بازگشت وب‌سایت به حالت عمومی برنامه
+            connection_profile_id: profileValue ? Number(profileValue) : null,
         };
 
         try {
             await apiFetch(`/api/sites/${id}`, { method: "PUT", body: payload });
             document.getElementById("editSiteModal").classList.add("hidden");
             showToast("تنظیمات وب‌سایت با موفقیت ذخیره شد.", "success");
-            await Promise.all([loadSites(), loadOverview()]);
+            await Promise.all([loadSites(), loadOverview(), loadConnectionProfiles()]);
         } catch (err) {
             showToast(err.message, "error");
         }
@@ -1346,6 +1336,604 @@ function initLogsEvents() {
     }
 }
 
+/* ------------------- روش‌های اتصال اختصاصی وب‌سایت‌ها (پروکسی per-site) ------------------- */
+
+const CONNECTION_KIND_LABELS = {
+    proxy: "پروکسی",
+    direct: "اتصال مستقیم",
+};
+
+/** پرکردن هر <select> که فهرست روش‌های اتصال را نشان می‌دهد */
+function fillConnectionProfileSelect(select, { placeholder = "حالت عمومی برنامه" } = {}) {
+    if (!select) return;
+    const previous = select.value;
+    select.innerHTML =
+        `<option value="">${escapeHtml(placeholder)}</option>` +
+        state.connectionProfiles
+            .map((p) => {
+                const label =
+                    p.kind === "direct"
+                        ? `${p.name} — اتصال مستقیم (بدون پروکسی)`
+                        : `${p.name} — ${p.connection_label || "پروکسی"}`;
+                const suffix = p.is_enabled ? "" : " (غیرفعال)";
+                return `<option value="${p.id}">${escapeHtml(label)}${suffix}</option>`;
+            })
+            .join("");
+    if (previous && state.connectionProfiles.some((p) => String(p.id) === String(previous))) {
+        select.value = previous;
+    }
+}
+
+function renderConnectionSummary() {
+    const summary = state.connectionSummary || {};
+    const set = (selector, value) => {
+        const el = $(selector);
+        if (el) el.textContent = formatNumberFa(value || 0);
+    };
+    set("#cpSummaryProfiles", summary.profiles);
+    set("#cpSummaryAssigned", summary.assigned_sites);
+    set("#cpSummaryManual", summary.manual_proxy_sites);
+    set("#cpSummaryGeneral", summary.general_mode_sites);
+}
+
+function renderConnectionProfilesTable() {
+    const tbody = $("#connectionProfilesBody");
+    if (!tbody) return;
+
+    if (!state.connectionProfiles.length) {
+        tbody.innerHTML = `
+            <tr>
+                <td colspan="7" class="empty-cell">
+                    هنوز روش اتصال اختصاصی تعریف نکرده‌اید؛ همه وب‌سایت‌ها از تنظیمات عمومی بالای همین صفحه استفاده می‌کنند.
+                </td>
+            </tr>`;
+        return;
+    }
+
+    tbody.innerHTML = state.connectionProfiles
+        .map((p) => {
+            const kindLabel = CONNECTION_KIND_LABELS[p.kind] || p.kind;
+            const kindBadge =
+                p.kind === "direct"
+                    ? '<span class="badge badge-paused">اتصال مستقیم</span>'
+                    : '<span class="badge badge-proxy">پروکسی</span>';
+            const address = p.kind === "direct" ? "—" : `<code class="ltr-text">${escapeHtml(p.proxy_url || "")}</code>`;
+
+            const extras = [];
+            if (p.verify_ssl === true) extras.push("SSL همیشه بررسی شود");
+            if (p.verify_ssl === false) extras.push("بدون بررسی SSL");
+            if (p.request_timeout) extras.push(`مهلت ${toFa(p.request_timeout)} ثانیه`);
+            extras.push(p.fallback_direct ? "با مسیر جایگزین مستقیم" : "فقط از طریق پروکسی");
+            if (!p.is_enabled) extras.push("غیرفعال");
+
+            const assigned = p.assigned_site_list || [];
+            const assignedHtml = assigned.length
+                ? `<div class="cp-assigned-count"><strong>${formatNumberFa(assigned.length)}</strong> وب‌سایت</div>
+                   <div class="cp-assigned-names" title="${escapeHtml(
+                       assigned.map((s) => s.title).join("، ")
+                   )}">${escapeHtml(assigned.map((s) => s.title).join("، "))}</div>`
+                : '<span class="muted">به هیچ وب‌سایتی نسبت داده نشده</span>';
+
+            let testHtml = '<span class="muted">تست نشده</span>';
+            if (p.last_test_at) {
+                const badge =
+                    p.last_test_ok === true
+                        ? '<span class="badge badge-ok">موفق</span>'
+                        : '<span class="badge badge-error">ناموفق</span>';
+                testHtml = `${badge}<div class="error-hint" title="${escapeHtml(
+                    p.last_test_message || ""
+                )}">${escapeHtml(String(p.last_test_message || "").slice(0, 70))}</div>
+                <div class="muted cp-test-time">${escapeHtml(p.last_test_display || "")}</div>`;
+            }
+
+            return `
+            <tr>
+                <td>
+                    <div class="ch-title-wrap">
+                        <span class="ch-title">${escapeHtml(p.name)}</span>
+                        ${p.notes ? `<span class="ch-link">${escapeHtml(p.notes)}</span>` : ""}
+                    </div>
+                </td>
+                <td>${kindBadge}<div class="muted">${escapeHtml(kindLabel)}</div></td>
+                <td>${address}</td>
+                <td><div class="cp-extras">${extras.map((x) => escapeHtml(x)).join(" · ")}</div></td>
+                <td>${assignedHtml}</td>
+                <td>${testHtml}</td>
+                <td>
+                    <div class="row-actions">
+                        <button class="btn btn-outline btn-sm" data-cp-action="test" data-id="${p.id}">تست اتصال</button>
+                        <button class="btn btn-ghost btn-sm" data-cp-action="edit" data-id="${p.id}">ویرایش</button>
+                        <button class="btn btn-ghost btn-sm" data-cp-action="assign" data-id="${p.id}">انتخاب سایت‌ها</button>
+                        <button class="btn btn-danger-ghost btn-sm" data-cp-action="delete" data-id="${p.id}">حذف</button>
+                    </div>
+                </td>
+            </tr>`;
+        })
+        .join("");
+}
+
+function connectionSitesForList() {
+    if (Array.isArray(state.connectionSites) && state.connectionSites.length) return state.connectionSites;
+    return state.sites.map((s) => ({
+        id: s.id,
+        title: s.title,
+        domain: s.domain,
+        canonical_url: s.canonical_url,
+        is_active: s.is_active,
+        is_demo: s.is_demo,
+        posts_count: s.posts_count,
+        connection_profile_id: s.connection_profile_id,
+        connection_profile_name: s.connection_profile_name,
+        connection_label: s.connection_label,
+        proxy_url: s.proxy_url,
+    }));
+}
+
+function renderConnectionSiteList() {
+    const box = $("#cpSiteList");
+    if (!box) return;
+
+    const needle = normalizeSearchText(state.connectionSiteFilter || "");
+    const all = connectionSitesForList();
+    const visible = needle
+        ? all.filter((s) =>
+              normalizeSearchText(`${s.title || ""} ${s.domain || ""} ${s.canonical_url || ""}`).includes(needle)
+          )
+        : all;
+
+    if (!all.length) {
+        box.innerHTML =
+            '<div class="empty-cell">هنوز وب‌سایتی در برنامه ثبت نشده است. ابتدا از زبانه «۱. وب‌سایت‌ها» یک وب‌سایت اضافه کنید.</div>';
+        return;
+    }
+    if (!visible.length) {
+        box.innerHTML = '<div class="empty-cell">هیچ وب‌سایتی مطابق با این جستجو پیدا نشد.</div>';
+        return;
+    }
+
+    box.innerHTML = visible
+        .map((s) => {
+            const checked = state.connectionSelectedSites.has(String(s.id)) ? "checked" : "";
+            const hasCustom = Boolean(s.connection_profile_id) || Boolean(s.proxy_url);
+            const badge = s.connection_profile_name
+                ? `<span class="badge badge-proxy" title="${escapeHtml(s.connection_label || "")}">${escapeHtml(
+                      s.connection_profile_name
+                  )}</span>`
+                : hasCustom
+                ? `<span class="badge badge-proxy badge-proxy-manual" title="${escapeHtml(
+                      s.connection_label || ""
+                  )}">پروکسی دستی</span>`
+                : '<span class="badge badge-pending">حالت عمومی</span>';
+            const demo = s.is_demo ? '<span class="badge badge-demo">نمونه</span>' : "";
+            return `
+            <label class="cp-site-row">
+                <input type="checkbox" data-cp-site="${s.id}" ${checked} />
+                <span class="cp-site-main">
+                    <span class="cp-site-title">${escapeHtml(s.title || "")} ${demo}</span>
+                    <span class="cp-site-url ltr-text">${escapeHtml(s.canonical_url || "")}</span>
+                </span>
+                <span class="cp-site-state">${badge}</span>
+            </label>`;
+        })
+        .join("");
+}
+
+function updateConnectionSelectionUI() {
+    const ids = Array.from(state.connectionSelectedSites);
+    const countEl = $("#cpSelectedCount");
+    if (countEl) countEl.textContent = formatNumberFa(ids.length);
+
+    const namesEl = $("#cpSelectedNames");
+    if (namesEl) {
+        const sites = connectionSitesForList();
+        const names = ids
+            .map((id) => (sites.find((s) => String(s.id) === String(id)) || {}).title)
+            .filter(Boolean);
+        const shown = names.slice(0, 4).join("، ");
+        namesEl.textContent = names.length
+            ? `${shown}${names.length > 4 ? ` و ${toFa(names.length - 4)} مورد دیگر` : ""}`
+            : "";
+    }
+
+    const applyBtn = $("#btnApplyConnectionProfile");
+    if (applyBtn) applyBtn.disabled = ids.length === 0;
+}
+
+function resetConnectionProfileForm() {
+    state.editingProfileId = null;
+    const form = $("#connectionProfileForm");
+    if (form) form.reset();
+    $("#cpEditId").value = "";
+    $("#cpName").value = "";
+    $("#cpHost").value = "";
+    $("#cpPort").value = "";
+    $("#cpUser").value = "";
+    $("#cpPass").value = "";
+    $("#cpNotes").value = "";
+    $("#cpTimeout").value = "";
+    $("#cpVerifySsl").value = "inherit";
+    $("#cpFallback").checked = true;
+    $("#cpEnabled").checked = true;
+    const proxyRadio = document.querySelector('input[name="cpKind"][value="proxy"]');
+    if (proxyRadio) proxyRadio.checked = true;
+    toggleConnectionKindFields();
+
+    const title = $("#cpFormTitle");
+    if (title) title.textContent = "۱) تعریف روش اتصال جدید";
+    const saveBtn = $("#btnSaveConnectionProfile");
+    if (saveBtn) saveBtn.textContent = "ذخیره روش اتصال";
+    const cancelBtn = $("#btnCancelConnectionProfileEdit");
+    if (cancelBtn) cancelBtn.classList.add("hidden");
+    const msg = $("#cpFormMessage");
+    if (msg) msg.textContent = "";
+}
+
+function toggleConnectionKindFields() {
+    const directRadio = document.querySelector('input[name="cpKind"][value="direct"]');
+    const box = $("#cpProxyFields");
+    if (!box) return;
+    const isDirect = Boolean(directRadio && directRadio.checked);
+    box.classList.toggle("hidden", isDirect);
+}
+
+function fillConnectionProfileForm(profile) {
+    if (!profile) return;
+    state.editingProfileId = profile.id;
+    $("#cpEditId").value = profile.id;
+    $("#cpName").value = profile.name || "";
+    const kindRadio = document.querySelector(`input[name="cpKind"][value="${profile.kind === "direct" ? "direct" : "proxy"}"]`);
+    if (kindRadio) kindRadio.checked = true;
+    toggleConnectionKindFields();
+    $("#cpType").value = profile.proxy_type || "socks5";
+    $("#cpHost").value = profile.proxy_host || "";
+    $("#cpPort").value = profile.proxy_port || "";
+    $("#cpUser").value = profile.proxy_username || "";
+    $("#cpPass").value = profile.proxy_password_set ? "********" : "";
+    $("#cpVerifySsl").value =
+        profile.verify_ssl === true ? "on" : profile.verify_ssl === false ? "off" : "inherit";
+    $("#cpTimeout").value = profile.request_timeout ? String(profile.request_timeout) : "";
+    $("#cpFallback").checked = profile.fallback_direct !== false;
+    $("#cpNotes").value = profile.notes || "";
+    $("#cpEnabled").checked = profile.is_enabled !== false;
+
+    const title = $("#cpFormTitle");
+    if (title) title.textContent = `۱) ویرایش روش اتصال «${profile.name}»`;
+    const saveBtn = $("#btnSaveConnectionProfile");
+    if (saveBtn) saveBtn.textContent = "ذخیره تغییرات";
+    const cancelBtn = $("#btnCancelConnectionProfileEdit");
+    if (cancelBtn) cancelBtn.classList.remove("hidden");
+    const msg = $("#cpFormMessage");
+    if (msg) msg.textContent = "تغییرات از اولین دریافت بعدی وب‌سایت‌های متصل اعمال می‌شود.";
+}
+
+function collectConnectionProfilePayload() {
+    const kindRadio = document.querySelector('input[name="cpKind"]:checked');
+    const kind = kindRadio ? kindRadio.value : "proxy";
+    const verifyMode = $("#cpVerifySsl").value;
+    const timeoutRaw = $("#cpTimeout").value.trim();
+
+    return {
+        name: $("#cpName").value.trim(),
+        kind,
+        proxy_type: $("#cpType").value,
+        proxy_host: $("#cpHost").value.trim(),
+        proxy_port: $("#cpPort").value.trim(),
+        proxy_username: $("#cpUser").value.trim(),
+        proxy_password: $("#cpPass").value,
+        verify_ssl: verifyMode === "on" ? true : verifyMode === "off" ? false : null,
+        request_timeout: timeoutRaw ? Number(timeoutRaw) : null,
+        fallback_direct: $("#cpFallback").checked,
+        notes: $("#cpNotes").value.trim(),
+        is_enabled: $("#cpEnabled").checked,
+    };
+}
+
+function showAssignResult(message, ok) {
+    const box = $("#cpAssignResult");
+    if (!box) return;
+    box.className = `preview-box ${ok ? "safe" : "danger"}`;
+    box.textContent = message;
+}
+
+function showTestResult(message, ok) {
+    const box = $("#cpTestResultBox");
+    if (!box) return;
+    box.className = `preview-box ${ok ? "safe" : "danger"}`;
+    box.innerHTML = message;
+}
+
+async function loadConnectionProfiles() {
+    try {
+        const data = await apiFetch("/api/connection-profiles");
+        state.connectionProfiles = data.items || [];
+        state.connectionSummary = data.summary || {};
+        state.connectionSites = Array.isArray(data.sites) ? data.sites : [];
+
+        renderConnectionSummary();
+        renderConnectionProfilesTable();
+        fillConnectionProfileSelect($("#cpAssignProfile"), {
+            placeholder: "حالت عمومی برنامه (بدون پروکسی اختصاصی)",
+        });
+        fillConnectionProfileSelect($("#probeConnectionProfile"), {
+            placeholder: "حالت عمومی برنامه",
+        });
+        renderConnectionSiteList();
+        updateConnectionSelectionUI();
+
+        if (
+            state.editingProfileId &&
+            !state.connectionProfiles.some((p) => String(p.id) === String(state.editingProfileId))
+        ) {
+            resetConnectionProfileForm();
+        }
+    } catch (err) {
+        showToast(err.message, "error");
+    }
+}
+
+async function saveConnectionProfile(button) {
+    const payload = collectConnectionProfilePayload();
+    if (!payload.name) {
+        showToast("نام روش اتصال را وارد کنید.", "error");
+        return;
+    }
+    if (payload.kind === "proxy" && (!payload.proxy_host || !payload.proxy_port)) {
+        showToast("برای روش اتصال پروکسی، وارد کردن آدرس میزبان و پورت الزامی است.", "error");
+        return;
+    }
+
+    const editingId = state.editingProfileId;
+    setBusy(button, true, "در حال ذخیره...");
+    try {
+        const res = editingId
+            ? await apiFetch(`/api/connection-profiles/${editingId}`, { method: "PUT", body: payload })
+            : await apiFetch("/api/connection-profiles", { method: "POST", body: payload });
+        showToast(res.message || "روش اتصال ذخیره شد.", "success", 6000);
+        resetConnectionProfileForm();
+        await loadConnectionProfiles();
+    } catch (err) {
+        showToast(err.message, "error");
+    } finally {
+        setBusy(button, false);
+    }
+}
+
+async function testConnectionProfile(profileId, button) {
+    const profile = state.connectionProfiles.find((p) => String(p.id) === String(profileId));
+    const assigned = (profile && profile.assigned_site_list) || [];
+    const target = assigned.length ? assigned[0].canonical_url : "";
+
+    setBusy(button, true, "تست اتصال...");
+    showTestResult("در حال تست اتصال از طریق این روش اتصال ...", true);
+    try {
+        const res = await apiFetch(`/api/connection-profiles/${profileId}/test`, {
+            method: "POST",
+            body: target ? { target_url: target } : {},
+        });
+        const targetLine = `آدرس تست: <code class="ltr-text">${escapeHtml(res.target_url || "")}</code>`;
+        const ipLine = res.exit_ip
+            ? ` — IP خروجی: <code class="ltr-text">${escapeHtml(res.exit_ip)}</code>`
+            : "";
+        const timeLine = `زمان پاسخ: ${formatNumberFa(res.elapsed_ms)} میلی‌ثانیه`;
+        showTestResult(
+            `<strong>${res.ok ? "اتصال برقرار است." : "اتصال برقرار نشد."}</strong> ${escapeHtml(
+                res.message || ""
+            )}<br>${targetLine}${ipLine}<br>${timeLine}`,
+            Boolean(res.ok)
+        );
+        showToast(res.message || (res.ok ? "تست اتصال موفق بود." : "تست اتصال ناموفق بود."), res.ok ? "success" : "error", 6000);
+        await loadConnectionProfiles();
+    } catch (err) {
+        showTestResult(err.message, false);
+        showToast(err.message, "error");
+    } finally {
+        setBusy(button, false);
+    }
+}
+
+async function deleteConnectionProfile(profileId, button) {
+    const profile = state.connectionProfiles.find((p) => String(p.id) === String(profileId));
+    const assignedCount = (profile && (profile.assigned_site_list || []).length) || 0;
+    const confirmed = window.confirm(
+        `روش اتصال «${profile ? profile.name : profileId}» حذف شود؟\n\n` +
+            (assignedCount
+                ? `${toFa(assignedCount)} وب‌سایت متصل به آن، به حالت عمومی برنامه بازمی‌گردند.`
+                : "این روش اتصال به هیچ وب‌سایتی نسبت داده نشده است.")
+    );
+    if (!confirmed) return;
+
+    setBusy(button, true, "در حال حذف...");
+    try {
+        const res = await apiFetch(`/api/connection-profiles/${profileId}`, { method: "DELETE" });
+        showToast(res.message || "روش اتصال حذف شد.", "success", 6000);
+        if (String(state.editingProfileId) === String(profileId)) resetConnectionProfileForm();
+        await Promise.all([loadConnectionProfiles(), loadSites(), loadOverview()]);
+    } catch (err) {
+        showToast(err.message, "error");
+    } finally {
+        setBusy(button, false);
+    }
+}
+
+async function applyConnectionProfileToSelected(button) {
+    const ids = Array.from(state.connectionSelectedSites);
+    if (!ids.length) {
+        showToast("ابتدا دست‌کم یک وب‌سایت را از فهرست انتخاب کنید.", "error");
+        return;
+    }
+
+    const raw = ($("#cpAssignProfile") && $("#cpAssignProfile").value) || "";
+    const profileId = raw ? Number(raw) : null;
+    const profile = state.connectionProfiles.find((p) => String(p.id) === String(raw));
+
+    const confirmed = window.confirm(
+        profileId
+            ? `روش اتصال «${profile ? profile.name : raw}» روی ${toFa(ids.length)} وب‌سایت انتخاب‌شده اعمال شود؟\n\n` +
+              "از دریافت بعدی، فقط این وب‌سایت‌ها از این پروکسی استفاده می‌کنند و بقیه وب‌سایت‌ها در حالت عمومی باقی می‌مانند."
+            : `${toFa(ids.length)} وب‌سایت انتخاب‌شده به «حالت عمومی برنامه» بازگردانده شوند؟`
+    );
+    if (!confirmed) return;
+
+    setBusy(button, true, "در حال اعمال...");
+    try {
+        const res = await apiFetch("/api/connection-profiles/assign", {
+            method: "POST",
+            body: {
+                profile_id: profileId,
+                site_ids: ids.map((id) => Number(id)),
+                clear_manual_proxy: true,
+            },
+        });
+        showAssignResult(res.message || "روش اتصال اعمال شد.", true);
+        showToast(res.message || "روش اتصال اعمال شد.", "success", 6000);
+        state.connectionSelectedSites.clear();
+        await Promise.all([loadConnectionProfiles(), loadSites(), loadOverview()]);
+    } catch (err) {
+        showAssignResult(err.message, false);
+        showToast(err.message, "error");
+    } finally {
+        setBusy(button, false);
+    }
+}
+
+function initConnectionProfileEvents() {
+    const form = $("#connectionProfileForm");
+    if (form) {
+        form.addEventListener("submit", (event) => {
+            event.preventDefault();
+            saveConnectionProfile($("#btnSaveConnectionProfile"));
+        });
+    }
+
+    $$('input[name="cpKind"]').forEach((radio) =>
+        radio.addEventListener("change", toggleConnectionKindFields)
+    );
+
+    const cancelBtn = $("#btnCancelConnectionProfileEdit");
+    if (cancelBtn) cancelBtn.addEventListener("click", resetConnectionProfileForm);
+
+    const reloadBtn = $("#btnReloadConnectionProfiles");
+    if (reloadBtn) {
+        reloadBtn.addEventListener("click", async () => {
+            setBusy(reloadBtn, true, "بروزرسانی...");
+            await Promise.all([loadConnectionProfiles(), loadSites()]);
+            setBusy(reloadBtn, false);
+            showToast("فهرست روش‌های اتصال بروزرسانی شد.", "success", 2500);
+        });
+    }
+
+    const searchInput = $("#cpSiteSearch");
+    if (searchInput) {
+        searchInput.addEventListener("input", () => {
+            state.connectionSiteFilter = searchInput.value;
+            renderConnectionSiteList();
+        });
+    }
+
+    const listBox = $("#cpSiteList");
+    if (listBox) {
+        listBox.addEventListener("change", (event) => {
+            const input = event.target;
+            if (!input || !input.dataset || !input.dataset.cpSite) return;
+            const siteId = String(input.dataset.cpSite);
+            if (input.checked) state.connectionSelectedSites.add(siteId);
+            else state.connectionSelectedSites.delete(siteId);
+            updateConnectionSelectionUI();
+        });
+    }
+
+    const selectAll = $("#btnCpSelectAll");
+    if (selectAll) {
+        selectAll.addEventListener("click", () => {
+            connectionSitesForList()
+                .filter((s) => {
+                    const needle = normalizeSearchText(state.connectionSiteFilter || "");
+                    if (!needle) return true;
+                    return normalizeSearchText(
+                        `${s.title || ""} ${s.domain || ""} ${s.canonical_url || ""}`
+                    ).includes(needle);
+                })
+                .forEach((s) => state.connectionSelectedSites.add(String(s.id)));
+            renderConnectionSiteList();
+            updateConnectionSelectionUI();
+        });
+    }
+
+    const selectNone = $("#btnCpSelectNone");
+    if (selectNone) {
+        selectNone.addEventListener("click", () => {
+            state.connectionSelectedSites.clear();
+            renderConnectionSiteList();
+            updateConnectionSelectionUI();
+        });
+    }
+
+    const selectCustom = $("#btnCpSelectCustom");
+    if (selectCustom) {
+        selectCustom.addEventListener("click", () => {
+            state.connectionSelectedSites.clear();
+            connectionSitesForList()
+                .filter((s) => Boolean(s.connection_profile_id) || Boolean(s.proxy_url))
+                .forEach((s) => state.connectionSelectedSites.add(String(s.id)));
+            renderConnectionSiteList();
+            updateConnectionSelectionUI();
+            if (!state.connectionSelectedSites.size) {
+                showToast("هیچ وب‌سایتی روش اتصال اختصاصی ندارد.", "info");
+            }
+        });
+    }
+
+    const applyBtn = $("#btnApplyConnectionProfile");
+    if (applyBtn) applyBtn.addEventListener("click", () => applyConnectionProfileToSelected(applyBtn));
+
+    const profilesBody = $("#connectionProfilesBody");
+    if (profilesBody) {
+        profilesBody.addEventListener("click", (event) => {
+            const button = event.target.closest("button[data-cp-action]");
+            if (!button) return;
+            const action = button.dataset.cpAction;
+            const profileId = button.dataset.id;
+            const profile = state.connectionProfiles.find((p) => String(p.id) === String(profileId));
+
+            if (action === "edit") {
+                fillConnectionProfileForm(profile);
+                const card = document.querySelector(".connection-card");
+                if (card) card.scrollIntoView({ behavior: "smooth", block: "start" });
+                return;
+            }
+            if (action === "test") {
+                testConnectionProfile(profileId, button);
+                return;
+            }
+            if (action === "assign") {
+                const select = $("#cpAssignProfile");
+                if (select) select.value = String(profileId);
+                if (profile) {
+                    state.connectionSelectedSites.clear();
+                    (profile.assigned_site_list || []).forEach((s) =>
+                        state.connectionSelectedSites.add(String(s.id))
+                    );
+                }
+                renderConnectionSiteList();
+                updateConnectionSelectionUI();
+                const listBoxEl = $("#cpSiteList");
+                if (listBoxEl) listBoxEl.scrollIntoView({ behavior: "smooth", block: "center" });
+                showToast(
+                    profile && (profile.assigned_site_list || []).length
+                        ? "وب‌سایت‌های متصل به این روش اتصال، در فهرست انتخاب شدند."
+                        : "اکنون وب‌سایت‌های دلخواه را از فهرست انتخاب کنید.",
+                    "info",
+                    5000
+                );
+                return;
+            }
+            if (action === "delete") {
+                deleteConnectionProfile(profileId, button);
+            }
+        });
+    }
+}
+
 /* ------------------------------ Settings ------------------------------ */
 
 async function loadSettings() {
@@ -1372,6 +1960,9 @@ async function loadSettings() {
     } catch (err) {
         showToast(err.message, "error");
     }
+
+    // روش‌های اتصال اختصاصی وب‌سایت‌ها (پروکسی per-site) در همان زبانه تنظیمات
+    await loadConnectionProfiles();
 }
 
 function toggleProxyFields() {
@@ -1458,9 +2049,13 @@ function initSettingsEvents() {
             box.textContent = "در حال اتصال و بررسی ساختار وب‌سایت ...";
             setBusy(probeBtn, true, "بررسی...");
             try {
+                const profileSelect = $("#probeConnectionProfile");
+                const profileId = profileSelect && profileSelect.value ? Number(profileSelect.value) : null;
                 const res = await apiFetch("/api/sites/probe", {
                     method: "POST",
-                    body: { site_input: rawUrl },
+                    body: profileId
+                        ? { site_input: rawUrl, connection_profile_id: profileId }
+                        : { site_input: rawUrl },
                 });
                 const modeLabel = SOURCE_MODE_LABELS[res.source_mode] || res.source_mode;
                 const samples = (res.sample_titles || [])
@@ -1472,6 +2067,9 @@ function initSettingsEvents() {
                     `<strong>اتصال موفق!</strong> عنوان: ${escapeHtml(res.site_title)}<br>` +
                     `موتور تشخیص‌داده‌شده: <strong>${escapeHtml(modeLabel)}</strong> — ` +
                     `${formatNumberFa(res.found_posts_count)} مطلب در صفحه اول یافت شد.` +
+                    (res.connection_label
+                        ? `<br>روش اتصال استفاده‌شده: <strong>${escapeHtml(res.connection_label)}</strong>`
+                        : "") +
                     (res.discovered_feed_url
                         ? `<br>فید کشف‌شده: <code class="ltr-text">${escapeHtml(res.discovered_feed_url)}</code>`
                         : "") +
@@ -2163,12 +2761,16 @@ async function boot() {
     initExports();
     initLogsEvents();
     initSettingsEvents();
+    initConnectionProfileEvents();
     initCleanupEvents();
     initBackupEvents();
+
+    resetConnectionProfileForm();
 
     await loadOverview();
     await loadSites();
     await loadPosts();
+    await loadConnectionProfiles();
 
     state.overviewTimer = window.setInterval(() => {
         if (!document.hidden) loadOverview();

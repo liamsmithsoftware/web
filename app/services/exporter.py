@@ -247,6 +247,14 @@ def create_sqlite_export_snapshot(
                 WHERE key IN ('proxy_username', 'proxy_password', 'custom_cookie')
                 """
             )
+            # پاک‌سازی رمز (و نام کاربری) روش‌های اتصال اختصاصی وب‌سایت‌ها
+            has_profiles = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'connection_profiles'"
+            ).fetchone()
+            if has_profiles:
+                conn.execute(
+                    "UPDATE connection_profiles SET proxy_password = '', proxy_username = ''"
+                )
 
         if filtered_post_ids is not None:
             if len(filtered_post_ids) == 0:

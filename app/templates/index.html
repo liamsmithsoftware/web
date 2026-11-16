@@ -613,6 +613,14 @@
                                 <small class="field-hint">پیش از افزودن، می‌توانید بررسی کنید سایت فید RSS دارد یا با خزشگر HTML خوانده می‌شود.</small>
                             </div>
 
+                            <div class="form-group">
+                                <label for="probeConnectionProfile">بررسی سایت از طریق کدام روش اتصال؟</label>
+                                <select id="probeConnectionProfile" class="form-control">
+                                    <option value="">حالت عمومی برنامه</option>
+                                </select>
+                                <small class="field-hint">برای اطمینان از اینکه یک سایت خاص با پروکسی اختصاصی شما باز می‌شود، همان روش اتصال را اینجا انتخاب کنید.</small>
+                            </div>
+
                             <div id="probeResultBox" class="preview-box hidden"></div>
                         </div>
                     </div>
@@ -631,6 +639,231 @@
                         </div>
                     </div>
                 </div>
+            </div>
+
+            <!-- ======================================================
+                 روش اتصال اختصاصی وب‌سایت‌ها (پروکسی per-site)
+                 ====================================================== -->
+            <div class="card connection-card">
+                <div class="card-header card-header-flex">
+                    <div>
+                        <h2 class="card-title">روش اتصال اختصاصی وب‌سایت‌ها (پروکسی جداگانه برای سایت‌های انتخابی)</h2>
+                        <p class="card-desc">
+                            یک یا چند «روش اتصال» (پروکسی SOCKS5/HTTP یا اتصال مستقیم) تعریف کنید، سپس وب‌سایت‌های دلخواه را از فهرست زیر انتخاب کرده و آن روش را به آنها نسبت دهید.
+                            از دریافت بعدی، <strong>فقط وب‌سایت‌های انتخاب‌شده</strong> از همان پروکسی استفاده می‌کنند و
+                            <strong>بقیه وب‌سایت‌ها بدون هیچ تغییری</strong> با همان حالت عمومی بالا (پروکسی سراسری یا اتصال مستقیم) دریافت می‌شوند.
+                        </p>
+                    </div>
+                    <div class="card-header-tools">
+                        <button id="btnReloadConnectionProfiles" type="button" class="btn btn-outline btn-sm">بروزرسانی فهرست</button>
+                    </div>
+                </div>
+
+                <div class="cleanup-summary connection-summary">
+                    <div class="cleanup-stat">
+                        <div class="cleanup-stat-label">روش‌های اتصال تعریف‌شده</div>
+                        <div class="cleanup-stat-value" id="cpSummaryProfiles">۰</div>
+                    </div>
+                    <div class="cleanup-stat">
+                        <div class="cleanup-stat-label">وب‌سایت با روش اختصاصی</div>
+                        <div class="cleanup-stat-value" id="cpSummaryAssigned">۰</div>
+                    </div>
+                    <div class="cleanup-stat">
+                        <div class="cleanup-stat-label">وب‌سایت با پروکسی دستی (قدیمی)</div>
+                        <div class="cleanup-stat-value" id="cpSummaryManual">۰</div>
+                    </div>
+                    <div class="cleanup-stat">
+                        <div class="cleanup-stat-label">وب‌سایت در حالت عمومی</div>
+                        <div class="cleanup-stat-value" id="cpSummaryGeneral">۰</div>
+                    </div>
+                </div>
+
+                <div class="connection-layout">
+                    <!-- ۱) تعریف / ویرایش روش اتصال -->
+                    <div class="connection-col">
+                        <h3 class="section-subtitle" id="cpFormTitle">۱) تعریف روش اتصال جدید</h3>
+                        <form id="connectionProfileForm" class="stack-form">
+                            <input type="hidden" id="cpEditId" value="" />
+
+                            <div class="form-group">
+                                <label for="cpName">نام روش اتصال <span class="req">*</span></label>
+                                <input id="cpName" type="text" class="form-control" placeholder="مثلاً: پروکسی v2ray محلی" required />
+                                <small class="field-hint">این نام در فهرست وب‌سایت‌ها و گزارش خطاها نمایش داده می‌شود.</small>
+                            </div>
+
+                            <div class="form-group">
+                                <label>نوع روش اتصال</label>
+                                <div class="radio-group">
+                                    <label class="radio-card">
+                                        <input type="radio" name="cpKind" value="proxy" checked />
+                                        <span>
+                                            <strong>پروکسی (SOCKS5 / HTTP)</strong>
+                                            <small class="field-hint block-hint">درخواست‌های این وب‌سایت‌ها از پروکسی مشخص‌شده عبور می‌کند.</small>
+                                        </span>
+                                    </label>
+                                    <label class="radio-card">
+                                        <input type="radio" name="cpKind" value="direct" />
+                                        <span>
+                                            <strong>اتصال مستقیم (بدون پروکسی)</strong>
+                                            <small class="field-hint block-hint">پروکسی عمومی برنامه برای این وب‌سایت‌ها نادیده گرفته می‌شود (مناسب سایت‌های داخلی).</small>
+                                        </span>
+                                    </label>
+                                </div>
+                            </div>
+
+                            <div id="cpProxyFields" class="proxy-box">
+                                <div class="form-row-3">
+                                    <div class="form-group">
+                                        <label for="cpType">نوع پروکسی</label>
+                                        <select id="cpType" class="form-control">
+                                            <option value="socks5">SOCKS5</option>
+                                            <option value="http">HTTP</option>
+                                            <option value="https">HTTPS</option>
+                                        </select>
+                                    </div>
+                                    <div class="form-group">
+                                        <label for="cpHost">آدرس (Host / IP) <span class="req">*</span></label>
+                                        <input id="cpHost" type="text" class="form-control ltr-input" placeholder="127.0.0.1" />
+                                    </div>
+                                    <div class="form-group">
+                                        <label for="cpPort">پورت (Port) <span class="req">*</span></label>
+                                        <input id="cpPort" type="text" class="form-control ltr-input" placeholder="10808" />
+                                    </div>
+                                </div>
+
+                                <div class="form-row-2">
+                                    <div class="form-group">
+                                        <label for="cpUser">نام کاربری پروکسی (اختیاری)</label>
+                                        <input id="cpUser" type="text" class="form-control ltr-input" placeholder="Username" autocomplete="off" />
+                                    </div>
+                                    <div class="form-group">
+                                        <label for="cpPass">رمز عبور پروکسی (اختیاری)</label>
+                                        <input id="cpPass" type="password" class="form-control ltr-input" placeholder="Password" autocomplete="new-password" />
+                                    </div>
+                                </div>
+
+                                <div class="form-row-2">
+                                    <div class="form-group">
+                                        <label for="cpVerifySsl">بررسی گواهی SSL برای این سایت‌ها</label>
+                                        <select id="cpVerifySsl" class="form-control">
+                                            <option value="inherit" selected>همان تنظیمات عمومی برنامه</option>
+                                            <option value="on">همیشه بررسی شود</option>
+                                            <option value="off">بررسی نشود (سایت با گواهی نامعتبر)</option>
+                                        </select>
+                                    </div>
+                                    <div class="form-group">
+                                        <label for="cpTimeout">مهلت پاسخ (ثانیه — اختیاری)</label>
+                                        <input id="cpTimeout" type="number" min="5" max="120" class="form-control ltr-input" placeholder="خالی = همان تنظیمات عمومی" />
+                                    </div>
+                                </div>
+
+                                <div class="delete-option-box">
+                                    <label class="checkbox-label">
+                                        <input id="cpFallback" type="checkbox" checked />
+                                        <span>
+                                            <strong>در صورت پاسخ ندادن پروکسی، اتصال مستقیم هم امتحان شود</strong>
+                                            <small class="field-hint block-hint">اگر می‌خواهید این وب‌سایت‌ها فقط و فقط از پروکسی دریافت شوند، این تیک را بردارید.</small>
+                                        </span>
+                                    </label>
+                                </div>
+                            </div>
+
+                            <div class="form-group">
+                                <label for="cpNotes">یادداشت (اختیاری)</label>
+                                <input id="cpNotes" type="text" class="form-control" placeholder="مثلاً: فقط برای سایت‌های تحریمی" />
+                            </div>
+
+                            <div class="form-group">
+                                <label class="checkbox-label">
+                                    <input id="cpEnabled" type="checkbox" checked />
+                                    <span>این روش اتصال فعال باشد (در صورت غیرفعال‌کردن، وب‌سایت‌های متصل به آن موقتاً از حالت عمومی استفاده می‌کنند)</span>
+                                </label>
+                            </div>
+
+                            <div class="form-footer form-footer-between">
+                                <div class="row-actions">
+                                    <button type="submit" class="btn btn-primary" id="btnSaveConnectionProfile">ذخیره روش اتصال</button>
+                                    <button type="button" class="btn btn-ghost hidden" id="btnCancelConnectionProfileEdit">انصراف از ویرایش</button>
+                                </div>
+                                <div id="cpFormMessage" class="field-hint"></div>
+                            </div>
+                        </form>
+                    </div>
+
+                    <!-- ۲) انتخاب وب‌سایت‌ها و اعمال روش اتصال -->
+                    <div class="connection-col">
+                        <h3 class="section-subtitle">۲) انتخاب وب‌سایت‌ها و اعمال روش اتصال</h3>
+
+                        <div class="form-group">
+                            <label for="cpAssignProfile">روش اتصال مورد نظر</label>
+                            <select id="cpAssignProfile" class="form-control">
+                                <option value="">حالت عمومی برنامه (بدون پروکسی اختصاصی)</option>
+                            </select>
+                            <small class="field-hint">گزینه «حالت عمومی برنامه» وب‌سایت‌های انتخاب‌شده را از حالت اختصاصی خارج می‌کند.</small>
+                        </div>
+
+                        <div class="form-group">
+                            <label for="cpSiteSearch">جستجو در وب‌سایت‌ها</label>
+                            <input id="cpSiteSearch" type="text" class="form-control" placeholder="نام یا آدرس وب‌سایت..." />
+                        </div>
+
+                        <div class="row-actions cp-select-actions">
+                            <button type="button" class="btn btn-ghost btn-sm" id="btnCpSelectAll">انتخاب همه موارد فهرست</button>
+                            <button type="button" class="btn btn-ghost btn-sm" id="btnCpSelectNone">لغو انتخاب</button>
+                            <button type="button" class="btn btn-ghost btn-sm" id="btnCpSelectCustom">فقط سایت‌های دارای روش اختصاصی</button>
+                        </div>
+
+                        <div id="cpSiteList" class="cp-site-list" role="group" aria-label="فهرست وب‌سایت‌ها برای انتخاب">
+                            <div class="empty-cell">در حال بارگذاری فهرست وب‌سایت‌ها...</div>
+                        </div>
+
+                        <div class="selected-summary">
+                            <div class="preview-box">
+                                <strong id="cpSelectedCount">۰</strong> وب‌سایت انتخاب شده است.
+                                <span id="cpSelectedNames" class="muted"></span>
+                            </div>
+                        </div>
+
+                        <div class="form-footer">
+                            <button type="button" class="btn btn-primary" id="btnApplyConnectionProfile">
+                                اعمال روش اتصال روی وب‌سایت‌های انتخاب‌شده
+                            </button>
+                        </div>
+
+                        <div id="cpAssignResult" class="preview-box hidden"></div>
+                    </div>
+                </div>
+
+                <hr class="divider" />
+
+                <h3 class="section-subtitle">۳) فهرست روش‌های اتصال تعریف‌شده</h3>
+                <div class="table-responsive">
+                    <table class="data-table">
+                        <thead>
+                            <tr>
+                                <th>نام روش اتصال</th>
+                                <th>نوع اتصال</th>
+                                <th>آدرس پروکسی</th>
+                                <th>تنظیمات خاص</th>
+                                <th>وب‌سایت‌های متصل</th>
+                                <th>آخرین تست اتصال</th>
+                                <th>عملیات</th>
+                            </tr>
+                        </thead>
+                        <tbody id="connectionProfilesBody">
+                            <tr>
+                                <td colspan="7" class="empty-cell">هنوز روش اتصال اختصاصی تعریف نکرده‌اید؛ همه وب‌سایت‌ها از تنظیمات عمومی بالا استفاده می‌کنند.</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+
+                <div class="field-hint connection-note">
+                    نکته: وب‌سایت‌هایی که در این بخش انتخاب نمی‌شوند، هیچ تغییری در روش اتصال آنها ایجاد نمی‌شود و همان
+                    «تنظیمات عمومی پروکسی» (بالای همین صفحه) یا اتصال مستقیم برایشان استفاده می‌شود.
+                </div>
+
+                <div id="cpTestResultBox" class="preview-box hidden"></div>
             </div>
         </section>
 
@@ -910,28 +1143,6 @@
                     </div>
                 </div>
 
-                <!-- جدید: اختصاص پروکسی به انتخاب‌ها -->
-                <div class="danger-row" style="margin-top: 1rem; border-top: 1px solid #eee; padding-top: 1rem;">
-                    <div>
-                        <strong>اختصاص پروکسی اختصاصی به وب‌سایت‌های انتخاب‌شده</strong>
-                        <div class="field-hint">انتخاب یک یا چند وب‌سایت از لیست و تنظیم پروکسی (میزبان، پورت، نوع) برای آن‌ها.</div>
-                    </div>
-                    <div class="row-actions">
-                        <select id="proxyMultiSiteSelect" class="form-control compact-select" multiple size="5">
-                            <!-- سایت‌ها با جاوااسکریپت پر می‌شوند -->
-                        </select>
-                        <div style="display: flex; gap: 0.5rem; align-items: center;">
-                            <input id="proxyMultiHost" type="text" class="form-control compact-input" placeholder="میزبان (اختیاری)" style="width: 120px;" />
-                            <input id="proxyMultiPort" type="number" class="form-control compact-input" placeholder="پورت" style="width: 60px;" />
-                            <select id="proxyMultiType" class="form-control compact-select" style="width: 80px;">
-                                <option value="socks5">SOCKS5</option>
-                                <option value="http">HTTP</option>
-                                <option value="https">HTTPS</option>
-                            </select>
-                            <button id="btnApplyProxyMulti" type="button" class="btn btn-primary">ثبت</button>
-                        </div>
-                    </div>
-                </div>
             </div>
         </section>
     </main>
@@ -978,25 +1189,41 @@
                     </label>
                 </div>
 
-                <div class="form-row-2">
-                    <div class="form-group">
-                        <label for="editSiteProxyHost">میزبان پروکسی (اختیاری)</label>
-                        <input id="editSiteProxyHost" type="text" class="form-control" placeholder="مثلاً 127.0.0.1" />
-                    </div>
-                    <div class="form-group">
-                        <label for="editSiteProxyPort">پورت (اختیاری)</label>
-                        <input id="editSiteProxyPort" type="number" class="form-control" placeholder="مثلاً 1080" />
-                    </div>
+                <div class="form-group">
+                    <label for="editSiteConnectionProfile">روش اتصال این وب‌سایت</label>
+                    <select id="editSiteConnectionProfile" class="form-control">
+                        <option value="">حالت عمومی برنامه (پروکسی سراسری یا اتصال مستقیم)</option>
+                    </select>
+                    <small class="field-hint">
+                        روش‌های اتصال اختصاصی در زبانه «۴. تنظیمات، پروکسی و خزشگر وب» تعریف و به چند وب‌سایت نسبت داده می‌شوند.
+                    </small>
                 </div>
 
-                <div class="form-group">
-                    <label for="editSiteProxyType">نوع پروکسی</label>
-                    <select id="editSiteProxyType" class="form-control">
-                        <option value="socks5">SOCKS5</option>
-                        <option value="http">HTTP</option>
-                        <option value="https">HTTPS</option>
-                    </select>
-                </div>
+                <details class="advanced-details">
+                    <summary>پروکسی دستی فقط برای همین وب‌سایت (پیشرفته)</summary>
+                    <div class="form-row-2">
+                        <div class="form-group">
+                            <label for="editSiteProxyHost">میزبان پروکسی (اختیاری)</label>
+                            <input id="editSiteProxyHost" type="text" class="form-control ltr-input" placeholder="مثلاً 127.0.0.1" />
+                        </div>
+                        <div class="form-group">
+                            <label for="editSiteProxyPort">پورت (اختیاری)</label>
+                            <input id="editSiteProxyPort" type="text" class="form-control ltr-input" placeholder="مثلاً 10808" />
+                        </div>
+                    </div>
+
+                    <div class="form-group">
+                        <label for="editSiteProxyType">نوع پروکسی</label>
+                        <select id="editSiteProxyType" class="form-control">
+                            <option value="socks5">SOCKS5</option>
+                            <option value="http">HTTP</option>
+                            <option value="https">HTTPS</option>
+                        </select>
+                    </div>
+                    <small class="field-hint">
+                        اگر از بالا یک «روش اتصال» انتخاب کنید، این پروکسی دستی نادیده گرفته و پاک می‌شود. برای پاک‌کردن پروکسی دستی، هر دو فیلد را خالی بگذارید.
+                    </small>
+                </details>
 
                 <div class="modal-footer">
                     <button type="button" class="btn btn-ghost" data-close-modal="editSiteModal">انصراف</button>
