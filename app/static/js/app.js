@@ -30,7 +30,70 @@ const state = {
         media_type: "all",
     },
     selectedPostIds: new Set(),
-    editingSiteId: null,
+    editingSite    // <--- جدید: اختصاص پروکسی به انتخاب‌ها
+    const btnApplyProxyMulti = document.getElementById("btnApplyProxyMulti");
+    const proxyMultiSelect = document.getElementById("proxyMultiSiteSelect");
+    const proxyMultiHost = document.getElementById("proxyMultiHost");
+    const proxyMultiPort = document.getElementById("proxyMultiPort");
+    const proxyMultiType = document.getElementById("proxyMultiType");
+
+    if (btnApplyProxyMulti && proxyMultiSelect) {
+        btnApplyProxyMulti.addEventListener("click", async () => {
+            const selectedIds = Array.from(proxyMultiSelect.selectedOptions).map(opt => opt.value);
+            if (selectedIds.length === 0) {
+                showToast("لطفاً حداقل یک وب‌سایت را انتخاب کنید.", "error");
+                return;
+            }
+
+            const host = proxyMultiHost.value.trim();
+            const port = proxyMultiPort.value.trim();
+            const type = proxyMultiType.value;
+            const proxyUrl = (host && port) ? `${type}://${host}:${port}` : null;
+
+            const promises = selectedIds.map(async (id) => {
+                try {
+                    await apiFetch(`/api/sites/${id}`, {
+                        method: "PUT",
+                        body: { proxy_url: proxyUrl },
+                    });
+                } catch (err) {
+                    showToast(`خطا در آپدیت وب‌سایت ${id}: ${err.message}`, "error");
+                }
+            });
+
+            await Promise.all(promises);
+            showToast(`پروکسی برای ${selectedIds.length} وب‌سایت اعمال شد.`, "success");
+            await Promise.all([loadSites(), loadOverview()]);
+            
+            // پاک کردن انتخاب‌ها و فیلدها
+            proxyMultiSelect.selectedIndex = -1;
+            proxyMultiHost.value = "";
+            proxyMultiPort.value = "";
+            proxyMultiType.value = "socks5";
+        });
+
+        // پر کردن لیست انتخاب سایت‌ها هنگام رندر سایت‌ها
+        const renderProxySelect = () => {
+            proxyMultiSelect.innerHTML = '<option value="">انتخاب وب‌سایت...</option>';
+            state.sites.forEach(s => {
+                const opt = document.createElement("option");
+                opt.value = s.id;
+                opt.textContent = `${s.title} (${s.site_key})`;
+                proxyMultiSelect.appendChild(opt);
+            });
+        };
+        
+        // فراخوانی پس از هر بار رندر سایت‌ها
+        const originalRenderSites = window.renderSites;
+        window.renderSites = (...args) => {
+            originalRenderSites(...args);
+            renderProxySelect();
+        };
+    }
+
+    const tbody = document.getElementById("sitesTableBody");
+    if (tbody) {
+    Id: null,
     activeModalPost: null,
     overviewTimer: null,
 };
