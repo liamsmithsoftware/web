@@ -1252,6 +1252,9 @@ class DatabaseManager:
             except (TypeError, ValueError):
                 initial_limit = DEFAULT_INITIAL_LIMIT
 
+            # <--- جدید: پشتیبانی از پروکسی اختصاصی در بک‌آپ (اختیاری)
+            proxy_url = raw.get("proxy_url")
+
             existing = self.get_site_by_key(parsed.site_key)
             title = (raw.get("title") or "").strip() or None
 
@@ -1264,6 +1267,7 @@ class DatabaseManager:
                     interval_unit=interval_unit,
                     initial_limit=initial_limit,
                     is_active=bool(raw.get("is_active", True)),
+                    proxy_url=proxy_url,
                 )
                 report["updated_sites"] += 1
             else:
@@ -1276,6 +1280,7 @@ class DatabaseManager:
                         title=title,
                         is_active=bool(raw.get("is_active", True)),
                         is_demo=bool(raw.get("is_demo", False)),
+                        proxy_url=proxy_url,
                     )
                 except ValueError as exc:
                     report["skipped_sites"] += 1

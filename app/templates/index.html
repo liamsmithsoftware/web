@@ -909,6 +909,29 @@
                         <button id="btnDeleteSingleSite" type="button" class="btn btn-danger">حذف وب‌سایت</button>
                     </div>
                 </div>
+
+                <!-- جدید: اختصاص پروکسی به انتخاب‌ها -->
+                <div class="danger-row" style="margin-top: 1rem; border-top: 1px solid #eee; padding-top: 1rem;">
+                    <div>
+                        <strong>اختصاص پروکسی اختصاصی به وب‌سایت‌های انتخاب‌شده</strong>
+                        <div class="field-hint">انتخاب یک یا چند وب‌سایت از لیست و تنظیم پروکسی (میزبان، پورت، نوع) برای آن‌ها.</div>
+                    </div>
+                    <div class="row-actions">
+                        <select id="proxyMultiSiteSelect" class="form-control compact-select" multiple size="5">
+                            <!-- سایت‌ها با جاوااسکریپت پر می‌شوند -->
+                        </select>
+                        <div style="display: flex; gap: 0.5rem; align-items: center;">
+                            <input id="proxyMultiHost" type="text" class="form-control compact-input" placeholder="میزبان (اختیاری)" style="width: 120px;" />
+                            <input id="proxyMultiPort" type="number" class="form-control compact-input" placeholder="پورت" style="width: 60px;" />
+                            <select id="proxyMultiType" class="form-control compact-select" style="width: 80px;">
+                                <option value="socks5">SOCKS5</option>
+                                <option value="http">HTTP</option>
+                                <option value="https">HTTPS</option>
+                            </select>
+                            <button id="btnApplyProxyMulti" type="button" class="btn btn-primary">ثبت</button>
+                        </div>
+                    </div>
+                </div>
             </div>
         </section>
     </main>
