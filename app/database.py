@@ -131,7 +131,8 @@ class DatabaseManager:
                     last_status TEXT NOT NULL DEFAULT 'pending',
                     last_error TEXT,
                     created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
+                    updated_at TEXT NOT NULL,
+                    proxy_url TEXT  -- <--- جدید: ستون پروکسی اختصاصی در سطح اپلیکیشن
                 );
 
                 CREATE TABLE IF NOT EXISTS posts (
@@ -216,6 +217,12 @@ class DatabaseManager:
                 ORDER BY p.published_at_utc DESC, p.item_seq DESC;
                 """
             )
+            # <--- جدید: بررسی و اضافه کردن ستون proxy_url در صورت فقدان (Migration)
+            cur = conn.execute("PRAGMA table_info(sites)")
+            columns = [row["name"] for row in cur.fetchall()]
+            if "proxy_url" not in columns:
+                conn.execute("ALTER TABLE sites ADD COLUMN proxy_url TEXT")
+
             for k, v in DEFAULT_SETTINGS.items():
                 conn.execute(
                     "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
