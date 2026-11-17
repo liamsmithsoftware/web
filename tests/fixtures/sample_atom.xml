@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>وبلاگ مهندسی نرم‌افزار</title>
+  <link href="https://devblog.example.com/" rel="alternate" />
+  <entry>
+    <title>آموزش معماری ماژولار در پایتون</title>
+    <link href="https://devblog.example.com/posts/modular-python" rel="alternate" />
+    <id>tag:devblog.example.com,2026:1</id>
+    <published>2026-11-10T11:15:00Z</published>
+    <summary type="html">&lt;p&gt;راهنمای کاربردی طراحی ماژولار&lt;/p&gt;</summary>
+  </entry>
+</feed>

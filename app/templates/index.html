@@ -1,0 +1,1084 @@
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>سامانه هوشمند جمع‌آوری و آرشیو مطالب وب‌سایت‌ها</title>
+    <link rel="stylesheet" href="/static/css/style.css?v=proxy-assignments-1" />
+</head>
+<body>
+    <!-- Top Header -->
+    <header class="app-header">
+        <div class="container header-inner">
+            <div class="brand">
+                <div class="brand-icon" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="2">
+                        <circle cx="12" cy="12" r="9.5"/>
+                        <path d="M2.5 12h19" stroke-linecap="round"/>
+                        <path d="M12 2.5a14.5 14.5 0 0 1 0 19 14.5 14.5 0 0 1 0-19z" stroke-linejoin="round"/>
+                    </svg>
+                </div>
+                <div>
+                    <h1 class="brand-title">آرشیو هوشمند مطالب وب‌سایت‌ها</h1>
+                    <div class="brand-subtitle">
+                        پایش زمان‌بندی‌شده سایت‌ها، جلوگیری خودکار از تکرار مطالب و خروجی ساختارمند Excel و SQLite
+                    </div>
+                </div>
+            </div>
+
+            <div class="header-actions">
+                <span id="schedulerBadge" class="scheduler-badge running" title="وضعیت زمان‌بند خودکار پس‌زمینه">
+                    <span class="pulse-dot"></span>
+                    <span id="schedulerBadgeText">زمان‌بند خودکار فعال</span>
+                </span>
+
+                <button id="btnSyncAll" class="btn btn-primary" type="button">
+                    <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M21 12a9 9 0 0 0-15.5-6.36L3 8"/><path d="M3 3v5h5"/>
+                        <path d="M3 12a9 9 0 0 0 15.5 6.36L21 16"/><path d="M16 16h5v5"/>
+                    </svg>
+                    <span>دریافت فوری همه</span>
+                </button>
+
+                <button id="btnQuickExcel" class="btn btn-success" type="button">
+                    <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                        <polyline points="14 2 14 8 20 8"/>
+                        <path d="M9 13l6 6M15 13l-6 6"/>
+                    </svg>
+                    <span>خروجی اکسل (.xlsx)</span>
+                </button>
+
+                <button id="btnQuickSqlite" class="btn btn-outline" type="button">
+                    <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
+                        <ellipse cx="12" cy="5" rx="9" ry="3"/>
+                        <path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/>
+                        <path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/>
+                    </svg>
+                    <span>خروجی SQLite</span>
+                </button>
+            </div>
+        </div>
+    </header>
+
+    <!-- Main Container -->
+    <main class="container main-content">
+        <!-- Stats Cards -->
+        <section class="stats-grid" aria-label="خلاصه وضعیت سیستم">
+            <div class="stat-card">
+                <div class="stat-label">وب‌سایت‌های ثبت‌شده</div>
+                <div class="stat-value"><span id="statTotalSites">0</span></div>
+                <div class="stat-meta"><span id="statActiveSites">0</span> وب‌سایت در حال پایش خودکار</div>
+            </div>
+
+            <div class="stat-card">
+                <div class="stat-label">مطالب ذخیره‌شده در دیتابیس</div>
+                <div class="stat-value"><span id="statTotalPosts">0</span></div>
+                <div class="stat-meta" id="statLatestPost">آخرین مطلب: —</div>
+            </div>
+
+            <div class="stat-card">
+                <div class="stat-label">نزدیک‌ترین اجرای خودکار بعدی</div>
+                <div class="stat-value stat-value-sm" id="statNextFetch">—</div>
+                <div class="stat-meta">بررسی خودکار هر ۳۰ ثانیه</div>
+            </div>
+
+            <div class="stat-card">
+                <div class="stat-label">موتور دریافت و پایگاه داده</div>
+                <div class="stat-value stat-value-sm" id="statCollectorMode">هوشمند (RSS + خزشگر وب)</div>
+                <div class="stat-meta" id="statDbInfo">حجم SQLite: ۰ کیلوبایت</div>
+            </div>
+        </section>
+
+        <!-- Navigation Tabs -->
+        <nav class="tabs-nav" role="tablist">
+            <button class="tab-btn active" data-tab="sites" type="button">
+                ۱. مدیریت وب‌سایت‌ها و زمان‌بندی
+            </button>
+            <button class="tab-btn" data-tab="posts" type="button">
+                ۲. آرشیو مطالب ذخیره‌شده
+                <span id="postsCountBadge" class="tab-badge">0</span>
+            </button>
+            <button class="tab-btn" data-tab="logs" type="button">
+                ۳. گزارش دریافت و تاریخچه
+            </button>
+            <button class="tab-btn" data-tab="settings" type="button">
+                ۴. تنظیمات، پروکسی و خزشگر وب
+            </button>
+            <button class="tab-btn" data-tab="backup" type="button">
+                ۵. پشتیبان‌گیری و بازیابی
+            </button>
+            <button class="tab-btn" data-tab="cleanup" type="button">
+                ۶. حذف و پاک‌سازی داده‌ها
+            </button>
+        </nav>
+
+        <!-- TAB 1: WEBSITES -->
+        <section id="tab-sites" class="tab-panel active">
+            <!-- Add Website Card -->
+            <div class="card">
+                <div class="card-header">
+                    <div>
+                        <h2 class="card-title">افزودن وب‌سایت جدید</h2>
+                        <p class="card-desc">
+                            آدرس وب‌سایت، صفحه بخش خبری یا لینک فید RSS را وارد کرده و بازه زمانی بررسی خودکار (از چند دقیقه تا چند روز) را تعیین کنید. در اولین اتصال فقط ۱۰ مطلب آخر ذخیره می‌شود و از دفعات بعد تنها مطالب جدیدتر که قبلاً ثبت نشده‌اند دریافت خواهند شد.
+                        </p>
+                    </div>
+                </div>
+
+                <form id="addSiteForm" class="form-grid">
+                    <div class="form-group col-span-2">
+                        <label for="siteInput">آدرس وب‌سایت یا صفحه خبری / فید <span class="req">*</span></label>
+                        <input
+                            id="siteInput"
+                            type="text"
+                            class="form-control ltr-input"
+                            placeholder="https://example.com  یا  example.com/news  یا  https://example.com/rss"
+                            required
+                        />
+                        <small class="field-hint">پشتیبانی از آدرس صفحه اصلی سایت، بخش/دسته‌بندی خاص (مثلاً /news/economy) و لینک مستقیم فیدهای RSS / Atom</small>
+                    </div>
+
+                    <div class="form-group">
+                        <label for="siteTitle">عنوان نمایشی (اختیاری)</label>
+                        <input
+                            id="siteTitle"
+                            type="text"
+                            class="form-control"
+                            placeholder="خالی بگذارید تا خودکار از وب‌سایت خوانده شود"
+                        />
+                    </div>
+
+                    <div class="form-group">
+                        <label for="intervalValue">بازه زمانی بررسی خودکار <span class="req">*</span></label>
+                        <div class="input-combo">
+                            <input
+                                id="intervalValue"
+                                type="number"
+                                step="any"
+                                min="1"
+                                value="6"
+                                class="form-control"
+                                required
+                            />
+                            <select id="intervalUnit" class="form-control unit-select">
+                                <option value="hours" selected>ساعت</option>
+                                <option value="days">روز</option>
+                                <option value="minutes">دقیقه</option>
+                            </select>
+                        </div>
+                        <div class="preset-chips" aria-label="انتخاب سریع بازه زمانی">
+                            <button type="button" class="chip" data-val="2" data-unit="hours">هر ۲ ساعت</button>
+                            <button type="button" class="chip active" data-val="6" data-unit="hours">هر ۶ ساعت</button>
+                            <button type="button" class="chip" data-val="12" data-unit="hours">هر ۱۲ ساعت</button>
+                            <button type="button" class="chip" data-val="1" data-unit="days">هر ۱ روز</button>
+                            <button type="button" class="chip" data-val="3" data-unit="days">هر ۳ روز</button>
+                            <button type="button" class="chip" data-val="7" data-unit="days">هر ۷ روز</button>
+                        </div>
+                    </div>
+
+                    <div class="form-group">
+                        <label for="initialLimit">تعداد مطالب در اولین دریافت</label>
+                        <input
+                            id="initialLimit"
+                            type="number"
+                            min="1"
+                            max="100"
+                            value="10"
+                            class="form-control"
+                        />
+                        <small class="field-hint">پیش‌فرض: فقط ۱۰ مطلب آخر در شروع</small>
+                    </div>
+
+                    <div class="form-group form-actions-inline">
+                        <label class="checkbox-label">
+                            <input id="fetchNowCheck" type="checkbox" checked />
+                            <span>دریافت فوری ۱۰ مطلب آخر بلافاصله پس از افزودن</span>
+                        </label>
+                        <button id="btnAddSite" type="submit" class="btn btn-primary btn-lg">
+                            + افزودن وب‌سایت به لیست
+                        </button>
+                    </div>
+                </form>
+            </div>
+
+            <!-- Websites Table Card -->
+            <div class="card">
+                <div class="card-header card-header-flex">
+                    <div>
+                        <h2 class="card-title">لیست وب‌سایت‌های تحت پایش</h2>
+                        <p class="card-desc">وضعیت نشانگر ضدتکرار، موتور تشخیص‌داده‌شده و زمان‌بندی هر وب‌سایت</p>
+                    </div>
+                    <div class="card-header-tools">
+                        <button id="btnSeedDemoQuick" type="button" class="btn btn-ghost btn-sm" title="افزودن داده‌های نمونه برای تست جدول و خروجی اکسل/SQLite">
+                            بارگذاری داده نمونه آزمایشی
+                        </button>
+                        <button id="btnRefreshSites" type="button" class="btn btn-outline btn-sm">
+                            بروزرسانی لیست
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Sites Filters & Page-Size Bar -->
+                <form id="siteFiltersForm" class="filters-bar sites-filters-bar">
+                    <div class="filter-item filter-search">
+                        <label for="siteFilterSearch">جستجو در نام، دامنه، آدرس یا خطا</label>
+                        <input
+                            id="siteFilterSearch"
+                            type="text"
+                            class="form-control"
+                            placeholder="نام وب‌سایت یا آدرس (مثلاً centcom یا mei.edu)..."
+                        />
+                    </div>
+
+                    <div class="filter-item">
+                        <label for="siteFilterStatus">وضعیت وب‌سایت</label>
+                        <select id="siteFilterStatus" class="form-control">
+                            <option value="all">همه وضعیت‌ها</option>
+                            <option value="ok">فعال و پایش‌شده</option>
+                            <option value="error">دارای خطای دریافت</option>
+                            <option value="pending">در انتظار اولین دریافت</option>
+                            <option value="syncing">در حال دریافت</option>
+                            <option value="inactive">غیرفعال‌شده</option>
+                        </select>
+                    </div>
+
+                    <div class="filter-item">
+                        <label for="siteFilterSource">نوع منبع دریافت</label>
+                        <select id="siteFilterSource" class="form-control">
+                            <option value="all">همه منابع</option>
+                            <option value="has_feed">دارای فید RSS / وب‌سرویس</option>
+                            <option value="no_feed">خزشگر HTML / بدون فید</option>
+                        </select>
+                    </div>
+
+                    <div class="filter-item">
+                        <label for="sitesPageSize">تعداد در هر صفحه</label>
+                        <select id="sitesPageSize" class="form-control">
+                            <option value="10" selected>۱۰ عدد</option>
+                            <option value="20">۲۰ عدد</option>
+                            <option value="30">۳۰ عدد</option>
+                            <option value="all">همه</option>
+                        </select>
+                    </div>
+
+                    <div class="filter-actions">
+                        <button type="submit" class="btn btn-primary">اعمال فیلتر</button>
+                        <button id="btnClearSiteFilters" type="button" class="btn btn-ghost">پاک‌سازی</button>
+                    </div>
+                </form>
+
+                <div class="table-responsive">
+                    <table class="data-table">
+                        <thead>
+                            <tr>
+                                <th>نام و آدرس وب‌سایت</th>
+                                <th>بازه بررسی</th>
+                                <th>نشانگر آخرین مطلب (ضدتکرار)</th>
+                                <th>تعداد مطالب</th>
+                                <th>آخرین بررسی</th>
+                                <th>بررسی خودکار بعدی</th>
+                                <th>وضعیت</th>
+                                <th>عملیات</th>
+                            </tr>
+                        </thead>
+                        <tbody id="sitesTableBody">
+                            <tr>
+                                <td colspan="8" class="empty-cell">در حال بارگذاری لیست وب‌سایت‌ها...</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+
+                <!-- Sites Pagination -->
+                <div id="sitesPaginationBar" class="pagination-bar">
+                    <div id="sitesPaginationInfo" class="pagination-info">نمایش ۰ از ۰ وب‌سایت</div>
+                    <div class="pagination-controls">
+                        <div class="page-size-inline">
+                            <label for="sitesPageSizeBottom">تعداد نمایش:</label>
+                            <select id="sitesPageSizeBottom" class="form-control page-size-select">
+                                <option value="10" selected>۱۰</option>
+                                <option value="20">۲۰</option>
+                                <option value="30">۳۰</option>
+                                <option value="all">همه</option>
+                            </select>
+                        </div>
+                        <button id="btnSitesPrevPage" type="button" class="btn btn-outline btn-sm" disabled>صفحه قبل</button>
+                        <div id="sitesPageNumbers" class="page-numbers"></div>
+                        <span id="sitesPageIndicator" class="page-indicator">صفحه ۱ از ۱</span>
+                        <button id="btnSitesNextPage" type="button" class="btn btn-outline btn-sm" disabled>صفحه بعد</button>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- TAB 2: POSTS ARCHIVE -->
+        <section id="tab-posts" class="tab-panel">
+            <div class="card">
+                <div class="card-header card-header-flex">
+                    <div>
+                        <h2 class="card-title">آرشیو ساختارمند مطالب ذخیره‌شده</h2>
+                        <p class="card-desc">تفکیک دقیق بر اساس وب‌سایت، عنوان، آدرس مستقیم مطلب، تاریخ انتشار (شمسی و میلادی) و ساعت انتشار</p>
+                    </div>
+                    <div class="export-group">
+                        <button id="btnExportFilteredExcel" type="button" class="btn btn-success btn-sm">
+                            خروجی اکسل از فیلتر فعلی (.xlsx)
+                        </button>
+                        <button id="btnExportFullSqlite" type="button" class="btn btn-outline btn-sm">
+                            دانلود کل دیتابیس (.sqlite)
+                        </button>
+                        <button id="btnExportFilteredSqlite" type="button" class="btn btn-ghost btn-sm">
+                            SQLite فقط فیلتر فعلی
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Selection toolbar -->
+                <div id="selectionToolbar" class="selection-toolbar hidden">
+                    <div class="selection-info">
+                        <strong id="selectionCount">۰</strong> مطلب انتخاب شده است
+                        <span class="field-hint" id="selectionHint">— می‌توانید فقط موارد تیک‌خورده را حذف کنید</span>
+                    </div>
+                    <div class="row-actions">
+                        <button id="btnSelectAllMatching" type="button" class="btn btn-ghost btn-sm">
+                            انتخاب همه نتایج فیلتر (نه فقط این صفحه)
+                        </button>
+                        <button id="btnClearSelection" type="button" class="btn btn-outline btn-sm">لغو انتخاب</button>
+                        <button id="btnDeleteSelected" type="button" class="btn btn-danger btn-sm">
+                            حذف موارد انتخاب‌شده
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Filters Bar -->
+                <form id="postFiltersForm" class="filters-bar">
+                    <div class="filter-item">
+                        <label for="filterSite">وب‌سایت</label>
+                        <select id="filterSite" class="form-control">
+                            <option value="">همه وب‌سایت‌ها</option>
+                        </select>
+                    </div>
+
+                    <div class="filter-item filter-search">
+                        <label for="filterSearch">جستجو در عنوان، متن یا آدرس</label>
+                        <input id="filterSearch" type="text" class="form-control" placeholder="کلیدواژه مورد نظر..." />
+                    </div>
+
+                    <div class="filter-item">
+                        <label for="filterDateFrom">از تاریخ (شمسی یا میلادی)</label>
+                        <input id="filterDateFrom" type="text" class="form-control ltr-input" placeholder="1405/08/01 یا 2026-11-01" />
+                    </div>
+
+                    <div class="filter-item">
+                        <label for="filterDateTo">تا تاریخ</label>
+                        <input id="filterDateTo" type="text" class="form-control ltr-input" placeholder="1405/08/30 یا 2026-11-30" />
+                    </div>
+
+                    <div class="filter-item">
+                        <label for="filterMediaType">نوع محتوا</label>
+                        <select id="filterMediaType" class="form-control">
+                            <option value="all">همه انواع</option>
+                            <option value="text">متن / مقاله</option>
+                            <option value="photo">تصویر</option>
+                            <option value="video">ویدیو</option>
+                            <option value="document">فایل پیوست</option>
+                            <option value="voice">صوت</option>
+                        </select>
+                    </div>
+
+                    <div class="filter-actions">
+                        <button type="submit" class="btn btn-primary">اعمال فیلتر</button>
+                        <button id="btnClearFilters" type="button" class="btn btn-ghost">پاک‌سازی</button>
+                    </div>
+                </form>
+
+                <!-- Posts Table -->
+                <div class="table-responsive">
+                    <table class="data-table">
+                        <thead>
+                            <tr>
+                                <th class="select-col"><input id="selectAllPosts" type="checkbox" title="انتخاب همه ردیف‌های این صفحه" /></th>
+                                <th>وب‌سایت</th>
+                                <th>شماره ثبت</th>
+                                <th>تاریخ انتشار</th>
+                                <th>ساعت</th>
+                                <th>نوع / بازدید</th>
+                                <th>عنوان و خلاصه مطلب</th>
+                                <th>آدرس مستقیم مطلب</th>
+                                <th>جزئیات</th>
+                            </tr>
+                        </thead>
+                        <tbody id="postsTableBody">
+                            <tr>
+                                <td colspan="9" class="empty-cell">هنوز مطلبی ذخیره نشده است.</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+
+                <!-- Pagination -->
+                <div class="pagination-bar">
+                    <div id="postsPaginationInfo" class="pagination-info">نمایش ۰ از ۰ مطلب</div>
+                    <div class="pagination-controls">
+                        <button id="btnPrevPage" type="button" class="btn btn-outline btn-sm" disabled>صفحه قبل</button>
+                        <span id="pageIndicator" class="page-indicator">صفحه ۱ از ۱</span>
+                        <button id="btnNextPage" type="button" class="btn btn-outline btn-sm" disabled>صفحه بعد</button>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- TAB 3: LOGS -->
+        <section id="tab-logs" class="tab-panel">
+            <div class="card">
+                <div class="card-header card-header-flex">
+                    <div>
+                        <h2 class="card-title">گزارش اجرای زمان‌بند و تاریخچه دریافت‌ها</h2>
+                        <p class="card-desc">ردیابی دقیق دفعات اتصال به وب‌سایت‌ها، موتور استفاده‌شده، تعداد مطالب جدید و تغییرات نشانگر ثبت</p>
+                    </div>
+                    <div class="card-header-tools">
+                        <button id="btnRefreshLogs" type="button" class="btn btn-outline btn-sm">بروزرسانی گزارش</button>
+                        <button id="btnClearLogs" type="button" class="btn btn-danger-ghost btn-sm">پاک کردن تاریخچه</button>
+                    </div>
+                </div>
+
+                <div class="table-responsive">
+                    <table class="data-table">
+                        <thead>
+                            <tr>
+                                <th>زمان اجرا</th>
+                                <th>وب‌سایت</th>
+                                <th>نحوه اجرا</th>
+                                <th>موتور</th>
+                                <th>مطالب جدید</th>
+                                <th>تغییر نشانگر (شمارنده)</th>
+                                <th>مدت</th>
+                                <th>نتیجه و توضیحات</th>
+                            </tr>
+                        </thead>
+                        <tbody id="logsTableBody">
+                            <tr>
+                                <td colspan="8" class="empty-cell">هنوز گزارشی ثبت نشده است.</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </section>
+
+        <!-- TAB 4: SETTINGS -->
+        <section id="tab-settings" class="tab-panel">
+            <div class="settings-grid">
+                <!-- General & Proxy Settings -->
+                <div class="card">
+                    <div class="card-header">
+                        <h2 class="card-title">تنظیمات موتور دریافت، منطقه زمانی و پروکسی</h2>
+                        <p class="card-desc">نحوه ارتباط برنامه با وب‌سایت‌ها و قالب زمان‌بندی تاریخ و ساعت را مشخص کنید.</p>
+                    </div>
+
+                    <form id="settingsForm" class="stack-form">
+                        <div class="form-group">
+                            <label for="settingCollectorMode">روش دریافت مطالب از وب‌سایت‌ها</label>
+                            <select id="settingCollectorMode" class="form-control">
+                                <option value="auto">هوشمند ترکیبی (پیشنهادی: تشخیص خودکار فید RSS/Atom + خزشگر صفحات وب HTML)</option>
+                                <option value="rss">فقط فیدخوان استاندارد (RSS / Atom / JSON Feed)</option>
+                                <option value="html">فقط خزشگر مستقیم صفحات وب (HTML Scraper)</option>
+                            </select>
+                        </div>
+
+                        <div class="form-row-2">
+                            <div class="form-group">
+                                <label for="settingTimezone">منطقه زمانی تفکیک تاریخ و ساعت</label>
+                                <select id="settingTimezone" class="form-control">
+                                    <option value="Asia/Tehran">ایران — تهران (Asia/Tehran)</option>
+                                    <option value="UTC">جهانی (UTC)</option>
+                                    <option value="Europe/London">اروپا — لندن (Europe/London)</option>
+                                    <option value="America/New_York">آمریکا — نیویورک (America/New_York)</option>
+                                </select>
+                            </div>
+
+                            <div class="form-group">
+                                <label for="settingDefaultLimit">تعداد پیش‌فرض اولین دریافت</label>
+                                <input id="settingDefaultLimit" type="number" min="1" max="100" value="10" class="form-control" />
+                            </div>
+                        </div>
+
+                        <div class="delete-option-box">
+                            <label class="checkbox-label">
+                                <input id="settingFetchFullContent" type="checkbox" checked />
+                                <span>
+                                    <strong>دریافت متن کامل مقاله از صفحه اصلی هر مطلب</strong>
+                                    <small class="field-hint block-hint">
+                                        وقتی فید یا صفحه اول سایت فقط خلاصه کوتاه دارد، لینک مطلب جدید باز شده و متن کامل، تصویر و تاریخ دقیق استخراج می‌شود.
+                                    </small>
+                                </span>
+                            </label>
+                            <label class="checkbox-label" style="margin-top: 8px">
+                                <input id="settingVerifySsl" type="checkbox" checked />
+                                <span>
+                                    <strong>بررسی گواهی امنیتی SSL سایت‌ها</strong>
+                                    <small class="field-hint block-hint">
+                                        اگر وب‌سایتی گواهی SSL منقضی یا نامعتبر دارد و خطا می‌دهد، می‌توانید این تیک را بردارید.
+                                    </small>
+                                </span>
+                            </label>
+                        </div>
+
+                        <hr class="divider" />
+
+                        <div class="form-group">
+                            <label class="checkbox-label">
+                                <input id="settingProxyEnabled" type="checkbox" />
+                                <span><strong>استفاده از پروکسی (SOCKS5 / HTTP)</strong> برای اتصال به وب‌سایت‌ها</span>
+                            </label>
+                            <small class="field-hint">در صورت محدودیت شبکه برای دسترسی به برخی وب‌سایت‌ها، پروکسی لوکال (مثلاً v2rayN / Nekoray / Tor) یا سرور را وارد کنید.</small>
+                        </div>
+
+                        <div id="proxyFieldsBox" class="proxy-box">
+                            <div class="form-row-3">
+                                <div class="form-group">
+                                    <label for="settingProxyType">نوع پروکسی</label>
+                                    <select id="settingProxyType" class="form-control">
+                                        <option value="socks5">SOCKS5</option>
+                                        <option value="http">HTTP</option>
+                                    </select>
+                                </div>
+                                <div class="form-group">
+                                    <label for="settingProxyHost">آدرس (Host / IP)</label>
+                                    <input id="settingProxyHost" type="text" class="form-control ltr-input" placeholder="127.0.0.1" />
+                                </div>
+                                <div class="form-group">
+                                    <label for="settingProxyPort">پورت (Port)</label>
+                                    <input id="settingProxyPort" type="text" class="form-control ltr-input" placeholder="10808" />
+                                </div>
+                            </div>
+
+                            <div class="form-row-2">
+                                <div class="form-group">
+                                    <label for="settingProxyUser">نام کاربری پروکسی (اختیاری)</label>
+                                    <input id="settingProxyUser" type="text" class="form-control ltr-input" placeholder="Username" />
+                                </div>
+                                <div class="form-group">
+                                    <label for="settingProxyPass">رمز عبور پروکسی (اختیاری)</label>
+                                    <input id="settingProxyPass" type="password" class="form-control ltr-input" placeholder="Password" />
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="form-footer">
+                            <button type="submit" class="btn btn-primary">ذخیره تنظیمات پایه و پروکسی</button>
+                        </div>
+                    </form>
+                </div>
+
+                <!-- Advanced HTTP Settings + Site Probe + Demo Tools -->
+                <div class="stack-col">
+                    <div class="card">
+                        <div class="card-header">
+                            <h2 class="card-title">تنظیمات پیشرفته درخواست وب و بررسی اتصال (اختیاری)</h2>
+                            <p class="card-desc">
+                                برای اغلب وب‌سایت‌های عمومی نیازی به تغییر این بخش نیست. در صورت نیاز به کوکی نشست (برای سایت‌های نیازمند ورود) یا تغییر User-Agent از این بخش استفاده کنید.
+                            </p>
+                        </div>
+
+                        <div class="stack-form">
+                            <div class="form-row-2">
+                                <div class="form-group">
+                                    <label for="settingRequestTimeout">مهلت زمانی پاسخ سایت (ثانیه)</label>
+                                    <input id="settingRequestTimeout" type="number" min="5" max="120" value="25" class="form-control ltr-input" />
+                                </div>
+                                <div class="form-group">
+                                    <label for="settingCustomCookie">کوکی نشست (Cookie — اختیاری)</label>
+                                    <input id="settingCustomCookie" type="password" class="form-control ltr-input" placeholder="session_id=..." />
+                                </div>
+                            </div>
+
+                            <div class="form-group">
+                                <label for="settingUserAgent">شناسه مرورگر سفارشی (User-Agent — اختیاری)</label>
+                                <input id="settingUserAgent" type="text" class="form-control ltr-input" placeholder="خالی = مرورگر استاندارد Chrome" />
+                            </div>
+
+                            <div class="form-footer">
+                                <button id="btnSaveAdvancedHttp" type="button" class="btn btn-outline btn-sm">ذخیره تنظیمات پیشرفته</button>
+                            </div>
+
+                            <hr class="divider" />
+
+                            <div class="form-group">
+                                <label for="probeSiteInput">بررسی و تست سریع آدرس وب‌سایت</label>
+                                <div class="input-combo">
+                                    <input id="probeSiteInput" type="text" class="form-control ltr-input" placeholder="https://example.com" />
+                                    <button id="btnProbeSite" type="button" class="btn btn-outline">بررسی سایت</button>
+                                </div>
+                                <small class="field-hint">پیش از افزودن، می‌توانید بررسی کنید سایت فید RSS دارد یا با خزشگر HTML خوانده می‌شود.</small>
+                            </div>
+
+                            <div id="probeResultBox" class="preview-box hidden"></div>
+                        </div>
+                    </div>
+
+                    <div class="card">
+                        <div class="card-header">
+                            <h2 class="card-title">پروکسی اختصاصی برای وب‌سایت‌های انتخاب‌شده</h2>
+                            <p class="card-desc">یک یا چند وب‌سایت را انتخاب کنید تا دریافت اطلاعات آن‌ها از پراکسی جداگانه انجام شود.</p>
+                        </div>
+                        <div class="stack-form">
+                            <div class="form-group">
+                                <label for="proxyMultiSiteSelect">وب‌سایت‌ها (برای انتخاب چند مورد، Ctrl را نگه دارید)</label>
+                                <select id="proxyMultiSiteSelect" class="form-control" multiple size="6"></select>
+                            </div>
+                            <div class="form-row-3">
+                                <div class="form-group">
+                                    <label for="proxyMultiType">نوع پروکسی</label>
+                                    <select id="proxyMultiType" class="form-control">
+                                        <option value="socks5">SOCKS5</option>
+                                        <option value="http">HTTP</option>
+                                        <option value="https">HTTPS</option>
+                                    </select>
+                                </div>
+                                <div class="form-group">
+                                    <label for="proxyMultiHost">میزبان</label>
+                                    <input id="proxyMultiHost" type="text" class="form-control ltr-input" placeholder="127.0.0.1" />
+                                </div>
+                                <div class="form-group">
+                                    <label for="proxyMultiPort">پورت</label>
+                                    <input id="proxyMultiPort" type="number" min="1" max="65535" class="form-control ltr-input" placeholder="10808" />
+                                </div>
+                            </div>
+                            <div class="form-row-2">
+                                <div class="form-group">
+                                    <label for="proxyMultiUser">نام کاربری پروکسی (اختیاری)</label>
+                                    <input id="proxyMultiUser" type="text" class="form-control ltr-input" autocomplete="off" />
+                                </div>
+                                <div class="form-group">
+                                    <label for="proxyMultiPass">رمز عبور پروکسی (اختیاری)</label>
+                                    <input id="proxyMultiPass" type="password" class="form-control ltr-input" autocomplete="new-password" />
+                                </div>
+                            </div>
+                            <small class="field-hint">برای بازگشت وب‌سایت‌های انتخاب‌شده به پراکسی عمومی، میزبان و پورت را خالی بگذارید.</small>
+                            <div class="form-footer">
+                                <button id="btnApplyProxyMulti" type="button" class="btn btn-primary">اعمال پراکسی به سایت‌های انتخاب‌شده</button>
+                            </div>
+                            <hr class="divider" />
+                            <div>
+                                <strong>پراکسی‌های اختصاصی فعلی</strong>
+                                <span id="proxyAssignmentCount" class="badge badge-feed">۰ سایت</span>
+                            </div>
+                            <div class="table-responsive proxy-assignment-list">
+                                <table class="data-table proxy-assignment-table">
+                                    <thead>
+                                        <tr>
+                                            <th>وب‌سایت</th>
+                                            <th>پراکسی اختصاصی</th>
+                                            <th>عملیات</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody id="proxyAssignmentBody">
+                                        <tr><td colspan="3" class="empty-cell">در حال بارگذاری...</td></tr>
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Demo & Offline Testing Helper -->
+                    <div class="card">
+                        <div class="card-header">
+                            <h2 class="card-title">ابزار تست سریع محیط و خروجی‌ها</h2>
+                            <p class="card-desc">
+                                اگر می‌خواهید بدون اتصال به اینترنت، نحوه ذخیره‌سازی تفکیک‌شده (عنوان، لینک، تاریخ شمسی/میلادی، ساعت) و خروجی‌های <strong>Excel</strong> و <strong>SQLite</strong> را آزمایش کنید، از دکمه‌های زیر استفاده نمایید.
+                            </p>
+                        </div>
+                        <div class="demo-actions">
+                            <button id="btnSeedDemo" type="button" class="btn btn-outline">افزودن داده‌های نمونه آزمایشی</button>
+                            <button id="btnClearDemo" type="button" class="btn btn-danger-ghost">حذف داده‌های آزمایشی</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- TAB 5: BACKUP / RESTORE -->
+        <section id="tab-backup" class="tab-panel">
+            <div class="card">
+                <div class="card-header">
+                    <h2 class="card-title">پشتیبان‌گیری از فهرست وب‌سایت‌ها و تنظیمات</h2>
+                    <p class="card-desc">
+                        یک فایل <strong>JSON</strong> سبک شامل تمام وب‌سایت‌ها (آدرس، عنوان، فید، بازه زمانی، وضعیت فعال بودن،
+                        نشانگر آخرین مطلب) و تنظیمات برنامه می‌گیرید. این فایل را می‌توانید روی همان سیستم یا یک نصب تازه،
+                        دوباره بارگذاری کنید. مطالب آرشیو در این فایل نیست؛ برای آرشیو کامل از خروجی <strong>SQLite</strong> در زبانه آرشیو استفاده کنید.
+                    </p>
+                </div>
+
+                <div class="backup-options">
+                    <label class="checkbox-label">
+                        <input id="backupIncludeSettings" type="checkbox" checked />
+                        <span>تنظیمات برنامه (حالت دریافت، منطقه زمانی، پروکسی، تنظیمات خزشگر) هم در فایل باشد</span>
+                    </label>
+
+                    <label class="checkbox-label">
+                        <input id="backupIncludeSecrets" type="checkbox" />
+                        <span>
+                            اطلاعات حساس هم ذخیره شوند
+                            <small class="field-hint block-hint">
+                                رمز پروکسی و کوکی نشست. به‌صورت پیش‌فرض برای امنیت در فایل نوشته نمی‌شوند؛
+                                اگر این فایل را جای امنی نگه می‌دارید، می‌توانید تیک بزنید.
+                            </small>
+                        </span>
+                    </label>
+
+                    <label class="checkbox-label">
+                        <input id="backupOnlyActive" type="checkbox" />
+                        <span>فقط وب‌سایت‌های فعال در فایل باشند</span>
+                    </label>
+                </div>
+
+                <div class="form-footer-between backup-actions">
+                    <div class="row-actions">
+                        <button id="btnDownloadBackup" type="button" class="btn btn-primary">
+                            دانلود فایل پشتیبان (JSON)
+                        </button>
+                        <button id="btnPreviewBackup" type="button" class="btn btn-outline">
+                            پیش‌نمایش محتوا
+                        </button>
+                    </div>
+                    <span class="field-hint">پسوند فایل: <code class="ltr-text">.json</code></span>
+                </div>
+
+                <div id="backupPreviewBox" class="preview-box hidden"></div>
+            </div>
+
+            <div class="card">
+                <div class="card-header">
+                    <h2 class="card-title">بازیابی از فایل پشتیبان</h2>
+                    <p class="card-desc">
+                        فایل <code>.json</code> را انتخاب کنید. پیش از اعمال، محتوای فایل بررسی و نمایش داده می‌شود تا بدانید
+                        چند وب‌سایت اضافه یا به‌روزرسانی خواهد شد.
+                    </p>
+                </div>
+
+                <div class="stack-form">
+                    <div class="form-group">
+                        <label for="backupFileInput">فایل پشتیبان</label>
+                        <input id="backupFileInput" type="file" accept=".json,application/json" class="form-control file-input" />
+                        <small class="field-hint">حداکثر ۵ مگابایت — فقط فایل‌های JSON ساخته‌شده توسط همین برنامه</small>
+                    </div>
+
+                    <div class="form-group">
+                        <label>روش بازیابی</label>
+                        <div class="radio-group">
+                            <label class="radio-card">
+                                <input type="radio" name="restoreMode" value="merge" checked />
+                                <span>
+                                    <strong>ادغام (پیشنهادی)</strong>
+                                    <small class="field-hint block-hint">وب‌سایت‌های فایل اضافه یا به‌روزرسانی می‌شوند؛ هیچ وب‌سایت فعلی حذف نمی‌شود.</small>
+                                </span>
+                            </label>
+                            <label class="radio-card">
+                                <input type="radio" name="restoreMode" value="replace" />
+                                <span>
+                                    <strong>جایگزینی کامل</strong>
+                                    <small class="field-hint block-hint">ابتدا فهرست وب‌سایت‌ها و مطالب آن‌ها پاک می‌شود، سپس فایل بارگذاری می‌گردد.</small>
+                                </span>
+                            </label>
+                        </div>
+                    </div>
+
+                    <div class="delete-option-box">
+                        <label class="checkbox-label">
+                            <input id="restoreSettingsCheck" type="checkbox" checked />
+                            <span>تنظیمات موجود در فایل هم اعمال شود</span>
+                        </label>
+                        <label class="checkbox-label" style="margin-top: 8px">
+                            <input id="restoreOverwriteCheck" type="checkbox" />
+                            <span>
+                                تنظیمات فعلی با مقادیر فایل جایگزین شوند
+                                <small class="field-hint block-hint">
+                                    اگر تیک نزنید، فقط تنظیماتی که در برنامه خالی هستند از فایل پر می‌شوند.
+                                </small>
+                            </span>
+                        </label>
+                    </div>
+
+                    <div id="restorePreviewBox" class="preview-box hidden"></div>
+
+                    <div class="form-footer-between">
+                        <button id="btnValidateBackup" type="button" class="btn btn-outline">بررسی فایل</button>
+                        <button id="btnRestoreBackup" type="button" class="btn btn-success">بازیابی پشتیبان</button>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- TAB 6: CLEANUP / BULK DELETE -->
+        <section id="tab-cleanup" class="tab-panel">
+            <div class="card">
+                <div class="card-header">
+                    <h2 class="card-title">حذف گروهی مطالب آرشیو</h2>
+                    <p class="card-desc">
+                        می‌توانید همه مطالب را یک‌جا پاک کنید، یا فقط مطالب یک وب‌سایت خاص، یک بازه زمانی مشخص، یک نوع محتوا
+                        یا چند ردیف دستی انتخاب‌شده را حذف کنید. عملیات حذف برگشت‌پذیر نیست؛ پیش از تأیید، تعداد مطالب مطابق شرایط را ببینید.
+                    </p>
+                </div>
+
+                <div class="cleanup-summary">
+                    <div class="cleanup-stat">
+                        <span class="cleanup-stat-label">کل مطالب آرشیو</span>
+                        <span class="cleanup-stat-value" id="cleanupTotalPosts">۰</span>
+                    </div>
+                    <div class="cleanup-stat">
+                        <span class="cleanup-stat-label">وب‌سایت‌های ثبت‌شده</span>
+                        <span class="cleanup-stat-value" id="cleanupTotalSites">۰</span>
+                    </div>
+                    <div class="cleanup-stat">
+                        <span class="cleanup-stat-label">در حال انتخاب در جدول</span>
+                        <span class="cleanup-stat-value" id="cleanupSelectedCount">۰</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Mode A: scoped delete -->
+            <div class="card">
+                <div class="card-header">
+                    <h2 class="card-title">۱) حذف بر اساس فیلتر (وب‌سایت / بازه زمانی / نوع محتوا / جستجو)</h2>
+                    <p class="card-desc">هر فیلتر را خالی بگذارید، یعنی «همه». مثلاً فقط وب‌سایت را انتخاب کنید تا تمام مطالب آن وب‌سایت حذف شود.</p>
+                </div>
+
+                <form id="bulkDeleteForm" class="stack-form">
+                    <div class="form-row-2">
+                        <div class="form-group">
+                            <label for="deleteScopeSite">وب‌سایت</label>
+                            <select id="deleteScopeSite" class="form-control">
+                                <option value="">همه وب‌سایت‌ها</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label for="deleteScopeMedia">نوع محتوا</label>
+                            <select id="deleteScopeMedia" class="form-control">
+                                <option value="all">همه انواع</option>
+                                <option value="text">متن / مقاله</option>
+                                <option value="photo">تصویر</option>
+                                <option value="video">ویدیو</option>
+                                <option value="document">فایل پیوست</option>
+                                <option value="voice">صوت</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    <div class="form-row-2">
+                        <div class="form-group">
+                            <label for="deleteScopeDateFrom">از تاریخ (شمسی یا میلادی)</label>
+                            <input id="deleteScopeDateFrom" type="text" class="form-control ltr-input" placeholder="1405/08/01 یا 2026-11-01" />
+                        </div>
+                        <div class="form-group">
+                            <label for="deleteScopeDateTo">تا تاریخ</label>
+                            <input id="deleteScopeDateTo" type="text" class="form-control ltr-input" placeholder="1405/08/30 یا 2026-11-30" />
+                        </div>
+                    </div>
+
+                    <div class="form-group">
+                        <label for="deleteScopeSearch">جستجو در عنوان، متن یا آدرس مطلب (اختیاری)</label>
+                        <input id="deleteScopeSearch" type="text" class="form-control" placeholder="مثلاً: تبلیغات" />
+                        <small class="field-hint">اگر این کادر را پر کنید، فقط مطالبی حذف می‌شوند که این عبارت در عنوان، متن یا آدرس آن‌ها باشد.</small>
+                    </div>
+
+                    <div class="delete-option-box">
+                        <label class="checkbox-label">
+                            <input id="deleteResetCursors" type="checkbox" checked />
+                            <span>
+                                نشانگر آخرین مطلب وب‌سایت‌های متأثر ریست شود
+                                <small class="field-hint block-hint">
+                                    توصیه‌شده: پس از حذف، دریافت بعدی از ابتدا انجام می‌شود و همان ۱۰ مطلب آخر دوباره ذخیره می‌گردند.
+                                    اگر تیک را بردارید، مطالبی که حذف کرده‌اید دیگر دوباره دریافت نخواهند شد.
+                                </small>
+                            </span>
+                        </label>
+                    </div>
+
+                    <div class="preview-box" id="deletePreviewBox">
+                        <span>برای دیدن تعداد مطالب مطابق شرایط، روی «پیش‌نمایش» بزنید.</span>
+                    </div>
+
+                    <div class="form-footer-between">
+                        <div class="row-actions">
+                            <button id="btnPreviewDelete" type="button" class="btn btn-outline">پیش‌نمایش تعداد</button>
+                            <button id="btnApplyScopedDelete" type="submit" class="btn btn-danger">حذف مطالب این فیلتر</button>
+                        </div>
+                        <button id="btnResetDeleteScope" type="button" class="btn btn-ghost btn-sm">پاک کردن فیلترها</button>
+                    </div>
+                </form>
+            </div>
+
+            <!-- Mode B: selected rows -->
+            <div class="card">
+                <div class="card-header">
+                    <h2 class="card-title">۲) حذف ردیف‌های انتخاب‌شده از جدول آرشیو</h2>
+                    <p class="card-desc">
+                        در زبانه «آرشیو مطالب» کنار هر مطلب یک چک‌باکس هست؛ ردیف‌های مورد نظر را تیک بزنید و از این‌جا حذف کنید.
+                    </p>
+                </div>
+
+                <div class="selected-summary">
+                    <div class="preview-box" id="selectedPreviewBox">
+                        <span>هیچ مطلبی انتخاب نشده است.</span>
+                    </div>
+                    <div class="row-actions">
+                        <button id="btnGoToArchive" type="button" class="btn btn-outline btn-sm">رفتن به جدول آرشیو</button>
+                        <button id="btnClearSelectionFromCleanup" type="button" class="btn btn-ghost btn-sm">لغو انتخاب</button>
+                        <button id="btnDeleteSelectedFromCleanup" type="button" class="btn btn-danger">حذف موارد انتخاب‌شده</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Danger zone -->
+            <div class="card danger-card">
+                <div class="card-header">
+                    <h2 class="card-title danger-title">۳) پاک‌سازی کلی (Danger Zone)</h2>
+                    <p class="card-desc">این عملیات کل آرشیو را پاک می‌کند و قابل بازگشت نیست. پیشنهاد می‌شود ابتدا از زبانه آرشیو یک خروجی SQLite بگیرید.</p>
+                </div>
+
+                <div class="danger-row">
+                    <div>
+                        <strong>حذف تمام مطالب و گزارش‌ها، با نگه داشتن لیست وب‌سایت‌ها</strong>
+                        <div class="field-hint">وب‌سایت‌ها با تنظیمات و زمان‌بندی خود باقی می‌مانند و دریافت بعدی از صفر انجام می‌شود.</div>
+                    </div>
+                    <button id="btnPurgePostsOnly" type="button" class="btn btn-danger">پاک کردن همه مطالب</button>
+                </div>
+
+                <div class="danger-row">
+                    <div>
+                        <strong>حذف کامل همه داده‌ها (وب‌سایت‌ها + مطالب + گزارش‌ها)</strong>
+                        <div class="field-hint">برنامه به حالت اولیه برمی‌گردد؛ تنظیمات پروکسی و خزشگر حفظ می‌شود.</div>
+                    </div>
+                    <button id="btnPurgeEverything" type="button" class="btn btn-danger">حذف کامل همه داده‌ها</button>
+                </div>
+
+                <div class="danger-row">
+                    <div>
+                        <strong>پاک کردن تاریخچه گزارش‌های دریافت</strong>
+                        <div class="field-hint">فقط جدول گزارش‌ها خالی می‌شود؛ مطالب و وب‌سایت‌ها دست‌نخورده می‌مانند.</div>
+                    </div>
+                    <button id="btnPurgeLogs" type="button" class="btn btn-danger-ghost">پاک کردن گزارش‌ها</button>
+                </div>
+
+                <div class="danger-row">
+                    <div>
+                        <strong>حذف کامل یک وب‌سایت با تمام مطالب آن</strong>
+                        <div class="field-hint">برای حذف یک وب‌سایت خاص به‌همراه مطالب و گزارش‌هایش.</div>
+                    </div>
+                    <div class="row-actions">
+                        <select id="deleteSingleSite" class="form-control compact-select">
+                            <option value="">انتخاب وب‌سایت...</option>
+                        </select>
+                        <button id="btnDeleteSingleSite" type="button" class="btn btn-danger">حذف وب‌سایت</button>
+                    </div>
+                </div>
+
+            </div>
+        </section>
+    </main>
+
+    <!-- Edit Website Modal -->
+    <div id="editSiteModal" class="modal-backdrop hidden" role="dialog" aria-modal="true">
+        <div class="modal-card">
+            <div class="modal-header">
+                <h3>ویرایش تنظیمات و زمان‌بندی وب‌سایت</h3>
+                <button type="button" class="modal-close" data-close-modal="editSiteModal">&times;</button>
+            </div>
+            <form id="editSiteForm" class="stack-form">
+                <input type="hidden" id="editSiteId" />
+
+                <div class="form-group">
+                    <label for="editSiteTitle">عنوان نمایشی وب‌سایت</label>
+                    <input id="editSiteTitle" type="text" class="form-control" required />
+                </div>
+
+                <div class="form-row-2">
+                    <div class="form-group">
+                        <label for="editIntervalValue">مقدار بازه زمانی</label>
+                        <input id="editIntervalValue" type="number" step="any" min="1" class="form-control" required />
+                    </div>
+                    <div class="form-group">
+                        <label for="editIntervalUnit">واحد زمانی</label>
+                        <select id="editIntervalUnit" class="form-control">
+                            <option value="hours">ساعت</option>
+                            <option value="days">روز</option>
+                            <option value="minutes">دقیقه</option>
+                        </select>
+                    </div>
+                </div>
+
+                <div class="form-group">
+                    <label for="editInitialLimit">تعداد مطالب در دریافت اولیه</label>
+                    <input id="editInitialLimit" type="number" min="1" max="100" class="form-control" required />
+                </div>
+
+                <div class="form-group">
+                    <label class="checkbox-label">
+                        <input id="editSiteActive" type="checkbox" />
+                        <span>بررسی خودکار زمان‌بندی‌شده برای این وب‌سایت فعال باشد</span>
+                    </label>
+                </div>
+
+                <div class="form-row-2">
+                    <div class="form-group">
+                        <label for="editSiteProxyHost">میزبان پروکسی (اختیاری)</label>
+                        <input id="editSiteProxyHost" type="text" class="form-control" placeholder="مثلاً 127.0.0.1" />
+                    </div>
+                    <div class="form-group">
+                        <label for="editSiteProxyPort">پورت (اختیاری)</label>
+                        <input id="editSiteProxyPort" type="number" class="form-control" placeholder="مثلاً 1080" />
+                    </div>
+                </div>
+
+                <div class="form-group">
+                    <label for="editSiteProxyType">نوع پروکسی</label>
+                    <select id="editSiteProxyType" class="form-control">
+                        <option value="socks5">SOCKS5</option>
+                        <option value="http">HTTP</option>
+                        <option value="https">HTTPS</option>
+                    </select>
+                </div>
+
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-ghost" data-close-modal="editSiteModal">انصراف</button>
+                    <button type="submit" class="btn btn-primary">ذخیره تغییرات</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- Post Full Content Modal -->
+    <div id="postDetailModal" class="modal-backdrop hidden" role="dialog" aria-modal="true">
+        <div class="modal-card modal-lg">
+            <div class="modal-header">
+                <h3 id="modalPostSiteTitle">جزئیات مطلب</h3>
+                <button type="button" class="modal-close" data-close-modal="postDetailModal">&times;</button>
+            </div>
+            <h4 id="modalPostHeadline" class="modal-headline"></h4>
+            <div class="post-meta-strip">
+                <span class="meta-pill"><strong>شماره ثبت:</strong> <span id="modalPostSeq" class="ltr-text"></span></span>
+                <span class="meta-pill"><strong>تاریخ شمسی:</strong> <span id="modalPostJalali"></span></span>
+                <span class="meta-pill"><strong>تاریخ میلادی:</strong> <span id="modalPostGreg" class="ltr-text"></span></span>
+                <span class="meta-pill"><strong>ساعت انتشار:</strong> <span id="modalPostTime" class="ltr-text"></span></span>
+                <span class="meta-pill"><strong>بازدید:</strong> <span id="modalPostViews"></span></span>
+            </div>
+            <div id="modalPostContent" class="post-full-body"></div>
+            <div class="post-url-box">
+                <span>آدرس مستقیم مطلب در سایت:</span>
+                <a id="modalPostUrl" href="#" target="_blank" rel="noopener noreferrer" class="ltr-text"></a>
+            </div>
+            <div class="modal-footer">
+                <button id="btnCopyPostText" type="button" class="btn btn-outline btn-sm">کپی متن مطلب</button>
+                <button id="btnCopyPostLink" type="button" class="btn btn-outline btn-sm">کپی لینک مطلب</button>
+                <button type="button" class="btn btn-primary btn-sm" data-close-modal="postDetailModal">بستن</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Toast Container -->
+    <div id="toastContainer" class="toast-container" aria-live="polite"></div>
+
+    <script src="/static/js/app.js?v=proxy-assignments-1"></script>
+</body>
+</html>
